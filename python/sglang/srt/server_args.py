@@ -137,6 +137,7 @@ class ServerArgs:
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
+    speculative_max_running_requests: Optional[int] = None
 
     # Double Sparsity
     enable_double_sparsity: bool = False
@@ -918,6 +919,12 @@ class ServerArgs:
             type=str,
             help="The path of the draft model's small vocab table.",
             default=ServerArgs.speculative_token_map,
+        )
+        parser.add_argument(
+            "--speculative-max-running-requests",
+            type=int,
+            help="Max running requests before disabling speculative decoding when it's enabled.",
+            default=ServerArgs.speculative_max_running_requests,
         )
 
         # Double Sparsity

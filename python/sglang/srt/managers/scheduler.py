@@ -187,6 +187,7 @@ class Scheduler(
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+        self.spec_max_running_requests = server_args.speculative_max_running_requests
         self.gpu_id = gpu_id
         self.enable_hierarchical_cache = server_args.enable_hierarchical_cache
         self.page_size = server_args.page_size
@@ -1352,6 +1353,14 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def _should_skip_speculation(self, batch: ScheduleBatch) -> bool:
+        if not self.spec_algorithm.is_none():
+            return (
+                self.spec_max_running_requests is not None
+                and batch.batch_size() >= self.spec_max_running_requests
+            )
+        return True
+
     def run_batch(
         self, batch: ScheduleBatch
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
@@ -1367,7 +1376,7 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            if self.spec_algorithm.is_none():
+            if self._should_skip_speculation(batch):
                 model_worker_batch = batch.get_model_worker_batch()
                 logits_output, next_token_ids = self.tp_worker.forward_batch_generation(
                     model_worker_batch
