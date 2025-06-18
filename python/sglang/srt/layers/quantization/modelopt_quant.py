@@ -11,12 +11,15 @@ from sglang.srt.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
+
+# from sglang.srt.layers.moe.fused_moe_triton import UnquantizedFusedMoEMethod # circular dep
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.parameter import ModelWeightParameter, PerTensorScaleParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod, Fp8MoEMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     cutlass_fp8_supported,
@@ -247,6 +250,14 @@ class ModelOptFp4Config(QuantizationConfig):
         self.group_size = group_size
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.exclude_modules = exclude_modules
+        # self.nextn_quant_config = Fp8Config.from_config(
+        #         {
+        #             "activation_scheme": "dynamic",
+        #             "fmt": "e4m3",
+        #             "quant_method": "fp8",
+        #             "weight_block_size": [128, 128],
+        #         }
+        # )
 
     @classmethod
     def get_name(cls) -> str:
@@ -311,17 +322,30 @@ class ModelOptFp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional["QuantizeMethodBase"]:
+        if prefix.startswith("model.decoder."):
+            logger.warning(f"{prefix}, {type(layer)}")
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
         if isinstance(layer, LinearBase):
-            if is_layer_skipped(prefix, self.exclude_modules) or self.is_layer_excluded(
-                prefix, self.exclude_modules
+            if (
+                is_layer_skipped(prefix, self.exclude_modules)
+                or self.is_layer_excluded(
+                    prefix,
+                    self.exclude_modules,
+                    # ):
+                )
+                or prefix.startswith("model.decoder.")
             ):
+                if prefix.startswith("model.decoder."):
+                    # return ModelOptFp8LinearMethod(self)
+                    return UnquantizedLinearMethod()
                 return UnquantizedLinearMethod()
             return ModelOptFp4LinearMethod(self)
         if self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
         elif isinstance(layer, FusedMoE):
+            if prefix.startswith("model.decoder."):
+                return None
             return ModelOptNvFp4FusedMoEMethod(self)
         return None
 

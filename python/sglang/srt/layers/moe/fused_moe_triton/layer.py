@@ -352,7 +352,9 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix)
-        assert self.quant_method is not None
+        # assert self.quant_method is not None
+        if self.quant_method is None:
+            self.quant_method = UnquantizedFusedMoEMethod()
 
         self.quant_method.create_weights(
             layer=self,

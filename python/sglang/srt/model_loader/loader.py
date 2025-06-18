@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     filter_files_not_needed_for_inference,
     get_gguf_extra_tensor_names,
     get_quant_config,
+    get_quantization_config,
     gguf_quant_weights_iterator,
     initialize_dummy_weights,
     np_cache_weights_iterator,
@@ -150,6 +151,18 @@ def _initialize_model(
     quant_config = _get_quantization_config(
         model_config, load_config, packed_modules_mapping
     )
+    # This doesn't work because the ckpt is stored as bf16
+    # if quant_config.get_name() == "modelopt_fp4" and model_arch == "DeepseekV3ForCausalLMNextN":
+    #     logger.warning("Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model.")
+    #     quant_cls = get_quantization_config("fp8")
+    #     quant_config = quant_cls.from_config(
+    #             {
+    #                 "activation_scheme": "dynamic",
+    #                 "fmt": "e4m3",
+    #                 "quant_method": "fp8",
+    #                 "weight_block_size": [128, 128],
+    #             }
+    #     )
     return model_class(
         config=model_config.hf_config,
         quant_config=quant_config,

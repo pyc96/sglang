@@ -10,6 +10,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
+    UnquantizedFusedMoEMethod,
 )
 
 _config: Optional[Dict[str, Any]] = None
@@ -37,4 +38,5 @@ __all__ = [
     "fused_moe",
     "fused_experts",
     "get_config_file_name",
+    "UnquantizedFusedMoEMethod",
 ]
