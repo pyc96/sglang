@@ -252,6 +252,7 @@ class ServerArgs:
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
+    parallel_weight_downloading_model_path: Optional[str] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
     # Quantization and data type
@@ -2236,6 +2237,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.nccl_port,
             help="The port for NCCL distributed environment setup. Defaults to a random port.",
+        )
+        parser.add_argument(
+            "--parallel-weight-downloading-model-path",
+            type=str,
+            default=ServerArgs.parallel_weight_downloading_model_path,
+            help="A command to run in a separate process at server startup.",
         )
         parser.add_argument(
             "--checkpoint-engine-wait-weights-before-ready",

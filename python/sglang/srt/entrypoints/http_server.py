@@ -769,6 +769,8 @@ async def update_weights_from_disk(obj: UpdateWeightFromDiskReqInput, request: R
         "num_paused_requests": num_paused_requests,
     }
     if success:
+        if _global_state.tokenizer_manager.initial_weights_loaded is False:
+            _global_state.tokenizer_manager.initial_weights_loaded = True
         return ORJSONResponse(
             content,
             status_code=HTTPStatus.OK,
