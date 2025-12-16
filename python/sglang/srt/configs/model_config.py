@@ -829,9 +829,9 @@ class ModelConfig:
             # BaseConnector implements __del__() to clean up the local dir.
             # Since config files need to exist all the time, so we DO NOT use
             # with statement to avoid closing the client.
-            client = create_remote_connector(self.model_path)
+            client = create_remote_connector(self.model_path, None)
             if is_remote_url(self.model_path):
-                client.pull_files(allow_pattern=["*config.json"])
+                client.pull_files(allow_pattern=["*config.json", "*.py"])
                 self.model_weights = self.model_path
                 self.model_path = client.get_local_dir()
 

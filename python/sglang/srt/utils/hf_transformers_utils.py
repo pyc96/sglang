@@ -242,7 +242,7 @@ def get_config(
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
         # with statement to avoid closing the client.
-        client = create_remote_connector(model)
+        client = create_remote_connector(model, None)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         model = client.get_local_dir()
 
@@ -430,7 +430,7 @@ def get_tokenizer(
         # BaseConnector implements __del__() to clean up the local dir.
         # Since config files need to exist all the time, so we DO NOT use
         # with statement to avoid closing the client.
-        client = create_remote_connector(tokenizer_name)
+        client = create_remote_connector(tokenizer_name, None)
         client.pull_files(ignore_pattern=["*.pt", "*.safetensors", "*.bin"])
         tokenizer_name = client.get_local_dir()
 
