@@ -18,8 +18,13 @@ This module provides weight update functionality via IPC for checkpoint-engine c
 import logging
 from typing import Callable, Dict, Optional
 
+import gc
 import torch
 import zmq
+import traceback
+from typing import TypedDict
+import pickle
+from sglang.srt.model_loader.loader import device_loading_context
 
 try:
     from checkpoint_engine.worker import update_weights_from_ipc
@@ -71,21 +76,145 @@ class SGLangCheckpointEngineWorkerExtension:
         Args:
             zmq_handles: Dict mapping device UUID to ZMQ socket path
         """
+        # here
+
+        
         if self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
-        device_uuid = self.get_device_uuid()
+        # device_uuid = self.get_device_uuid()
         device_id = self.get_device_id()
-        if device_uuid not in zmq_handles:
+        rank = str(torch.distributed.get_rank())
+        if rank not in zmq_handles:
             raise ValueError(
-                f"Device UUID {device_uuid} not found in zmq_handles: {list(zmq_handles.keys())}"
+                f"Device UUID {rank} not found in zmq_handles: {list(zmq_handles.keys())}"
             )
-        update_weights_from_ipc(
+        
+        update_weights_from_ipc_local(
             self._zmq_ctx,
-            zmq_handles[device_uuid],
+            zmq_handles[rank],
             device_id=device_id,
             run=self.get_model_loader(),
             post_hook=self.get_post_hook(),
         )
+
+
+
+class FlattenedTensorMetadata(TypedDict):
+    name: str
+    shape: torch.Size
+    dtype: torch.dtype
+
+
+
+def _rebuild_ipc(handle: tuple[Callable, tuple], device_id: int | None = None) -> torch.Tensor:
+    func, args = handle
+    list_args = list(args)
+    if device_id is not None:
+        # the key is to change device id to the current device id
+        # in case two processes have different CUDA_VISIBLE_DEVICES
+        list_args[6] = device_id
+    buffer = func(*list_args)
+    return buffer
+
+
+def _extract_weights(
+    payload: list[FlattenedTensorMetadata], buffer: torch.Tensor
+) -> list[tuple[str, torch.Tensor]]:
+    assert buffer is not None
+    weights: list[tuple[str, torch.Tensor]] = []
+    for item in payload:
+        shape = item["shape"]
+        if isinstance(shape, list | tuple):
+            shape = torch.Size(shape)
+        assert isinstance(shape, torch.Size)
+        dtype = item["dtype"]
+        tensor = buffer.view(dtype=dtype).view(shape)
+        weights.append((item["name"], tensor))
+    return weights
+
+
+def update_weights_from_ipc_local(
+    zmq_ctx: zmq.Context,
+    zmq_handle: str,
+    device_id: int,
+    *,
+    run: Callable[[list[tuple[str, torch.Tensor]]], None],
+    post_hook: Callable[[], None] | None = None, 
+):
+    socket = zmq_ctx.socket(zmq.REP)
+    socket.connect(zmq_handle)
+    buffer: torch.Tensor | None = None
+
+    # try:
+    #     ipc_handle: tuple[Callable, tuple] = socket.recv_pyobj()
+    #     assert isinstance(ipc_handle, tuple)
+    #     buffer = _rebuild_ipc(ipc_handle, device_id)
+    #     assert buffer.dtype == torch.uint8
+    #     socket.send(b"")
+    # except Exception as e:
+    #     msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    #     socket.send_string(msg)
+    #     socket.recv()  # wait for ack
+    #     raise
+
+    try:
+        while True:
+            # payload: dict | list[FlattenedTensorMetadata] | Exception | None = socket.recv_pyobj()
+            payload: dict | None = socket.recv_pyobj()
+            if payload is None:  # done signal
+                print(f"rank: {torch.cuda.current_device()}: done!")
+                # if post_hook is not None:
+                #     post_hook()
+                torch.cuda.synchronize()
+                socket.send(b"")
+                break
+            if isinstance(payload, bytes):  # still updating weights
+                print(f"rank: {torch.cuda.current_device()}: got bytes!")
+                meta = pickle.loads(payload)
+
+                ipc_args = tuple(meta["ipc_args"])
+
+                # This should now succeed without the "Cannot pickle" error
+                shared_storage = torch.UntypedStorage._new_shared_cuda(*ipc_args)
+                    
+                # 2. Create a tensor view of that shared memory
+                weight = torch.tensor(
+                    [], dtype=meta["dtype"], device=f"cuda:{torch.cuda.current_device()}"
+                ).set_(shared_storage).view(meta["shape"])
+                weights = [(meta["name"], weight)]
+                run(weights)
+                torch.cuda.synchronize()
+                socket.send(b"")
+
+            # if isinstance(payload, list):  # still updating weights
+            #     try:
+            #         weights = _extract_weights(payload, buffer)
+            #         run(weights)
+            #         torch.cuda.synchronize()
+            #         socket.send(b"")
+            #     except Exception as e:  # noqa: BLE001
+            #         # Send exception back to Parameter Server.
+            #         # Don't raise here. Because all workers should quit in the same way by receiving the exception from PS
+            #         # msg = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+            #         # socket.send_string(msg)
+            #         # Raise it anyway here first
+            #         raise e
+            elif isinstance(
+                payload, Exception
+            ):  # error occurred, got force quit signal from Parameter Server
+                raise payload
+            else:
+                raise TypeError(f"Unexpected payload type: {type(payload)}")
+
+    finally:
+        print(f"rank: {torch.cuda.current_device()}: closing socket")
+        socket.close()
+        del buffer
+        print(f"rank: {torch.cuda.current_device()}: gc")
+        gc.collect()
+        print(f"rank: {torch.cuda.current_device()}: empty cache")
+        torch.cuda.empty_cache()
+        print(f"rank: {torch.cuda.current_device()}: return")
 
 
 class SGLangCheckpointEngineWorkerExtensionImpl(SGLangCheckpointEngineWorkerExtension):

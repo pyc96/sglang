@@ -783,6 +783,12 @@ class ModelRunner:
                 )
                 t.start()
 
+
+        if self.server_args.load_format == LoadFormat.EXTERNAL_LOADER:
+            # Sharing the address with external process.
+            if self.tp_rank == 0:
+                pass
+
         # Load the model
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
@@ -794,6 +800,7 @@ class ModelRunner:
             GPU_MEMORY_TYPE_WEIGHTS,
             enable_cpu_backup=enable_cpu_backup,
         ):
+            # model loading here
             self.model = get_model(
                 model_config=self.model_config,
                 load_config=self.load_config,
@@ -2837,6 +2844,9 @@ class ModelRunner:
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""
+
+        # Try to implment this thing here.
+        
         try:
             from sglang.srt.checkpoint_engine.checkpoint_engine_worker import (
                 SGLangCheckpointEngineWorkerExtensionImpl,
