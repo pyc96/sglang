@@ -96,6 +96,7 @@ def gen(
     choices_method: Optional[ChoicesSamplingMethod] = None,
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
+    skip_special_tokens: bool = True,  # python/sglang/srt/sampling/sampling_params.py:55 so set default to True
 ):
     """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
 
@@ -136,6 +137,7 @@ def gen(
         dtype,
         regex,
         json_schema,
+        skip_special_tokens,
     )
 
 

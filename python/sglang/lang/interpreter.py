@@ -807,6 +807,7 @@ class StreamExecutor:
             "dtype",
             "regex",
             "json_schema",
+            "skip_special_tokens",
         ]:
             value = getattr(sampling_params, item, None)
             if value is not None:
