@@ -152,6 +152,7 @@ class GptOssSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
             params_dtype=config.torch_dtype,
         )
+        self.capture_router_logits = True
 
     def forward(
         self,
@@ -186,6 +187,8 @@ class GptOssSparseMoeBlock(nn.Module):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
+        if self.capture_router_logits:
+            return ans, router_logits
         return ans
 
 
@@ -432,6 +435,9 @@ class GptOssDecoderLayer(nn.Module):
             ),
         )
 
+        # For capturing router decisions
+        self.capture_router_logits = True
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -460,7 +466,14 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        if self.capture_router_logits:
+            hidden_states, router_logits = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion
+            )
+        else:
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -470,7 +483,7 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual
+        return hidden_states, residual, router_logits
 
 
 class GptOssModel(nn.Module):
@@ -516,6 +529,8 @@ class GptOssModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.layers_to_capture = []
+        # To capture router decision
+        self.capture_router_logits = True
 
     def forward(
         self,
@@ -537,14 +552,22 @@ class GptOssModel(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
+        router_logits = None
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    aux_hidden_states.append(
+                        torch.cat((hidden_states + residual, router_logits), dim=-1)
+                    )
                 layer = self.layers[i]
-                hidden_states, residual = layer(
-                    positions, hidden_states, forward_batch, residual
-                )
+                if self.capture_router_logits:
+                    hidden_states, residual, router_logits = layer(
+                        positions, hidden_states, forward_batch, residual
+                    )
+                else:
+                    hidden_states, residual = layer(
+                        positions, hidden_states, forward_batch, residual
+                    )
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -589,6 +612,7 @@ class GptOssForCausalLM(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config)
         self.capture_aux_hidden_states = False
+        self.capture_router_logits = True
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
