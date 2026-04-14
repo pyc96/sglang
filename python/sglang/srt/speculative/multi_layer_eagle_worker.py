@@ -68,7 +68,6 @@ logger = logging.getLogger(__name__)
 
 
 class MultiLayerEagleWorker(TpModelWorker):
-
     def __init__(
         self,
         server_args: ServerArgs,
@@ -159,6 +158,18 @@ class MultiLayerEagleWorker(TpModelWorker):
             else:
                 self.draft_model_runner.model.set_embed(embed)
 
+            # Propagate embedding scale from target model to draft model.
+            target_embed_module = (
+                self.target_worker.model_runner.model.get_input_embeddings()
+            )
+            embed_scale = getattr(target_embed_module, "embed_scale", None)
+            if (
+                embed_scale is not None
+                and embed_scale != 1.0
+                and hasattr(self.draft_model_runner.model, "set_embed_scale")
+            ):
+                self.draft_model_runner.model.set_embed_scale(embed_scale)
+
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
                 self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
@@ -183,9 +194,10 @@ class MultiLayerEagleWorker(TpModelWorker):
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.mtp_model_runner(0).tp_group
-        ), speculative_moe_backend_context():
+        with (
+            self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+            speculative_moe_backend_context(),
+        ):
             self.init_attention_backend()
             self.init_cuda_graphs()
 
@@ -255,9 +267,10 @@ class MultiLayerEagleWorker(TpModelWorker):
                 seq_lens_cpu,
                 can_run_cuda_graph,
             ) = self.forward_target_extend(batch)
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 self.forward_draft_extend(
                     batch, logits_output.hidden_states, next_token_ids, seq_lens_cpu
                 )
@@ -268,17 +281,19 @@ class MultiLayerEagleWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 spec_info = self.draft(batch)
             logits_output, verify_output, model_worker_batch, can_run_cuda_graph = (
                 self.verify(batch, spec_info)
             )
 
-            with self.draft_tp_context(
-                self.mtp_model_runner(0).tp_group
-            ), speculative_moe_backend_context():
+            with (
+                self.draft_tp_context(self.mtp_model_runner(0).tp_group),
+                speculative_moe_backend_context(),
+            ):
                 # NOTE: We should use `check_forward_draft_extend_after_decode`
                 # when DP attention is enabled, but it is slow. Skip it for now.
                 if (

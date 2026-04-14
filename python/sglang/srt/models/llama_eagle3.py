@@ -80,7 +80,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -145,6 +144,12 @@ class LlamaModel(nn.Module):
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+        # Embedding scale factor applied after embed_tokens lookup.
+        # Target models like Gemma3 use scaled embeddings (hidden_size**0.5)
+        # but the weight shared via set_embed() is unscaled.  This attribute
+        # is set by set_embed_scale() after the target model is identified.
+        self.embed_scale = 1.0
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -166,6 +171,8 @@ class LlamaModel(nn.Module):
                 )
             if embeds is None:
                 embeds = self.embed_tokens(input_ids)
+                if self.embed_scale != 1.0:
+                    embeds = embeds * self.embed_scale
         else:
             embeds = input_embeds
 
@@ -285,6 +292,16 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
+
+    def set_embed_scale(self, scale: float):
+        """Set the embedding scale factor for target models with scaled embeddings.
+
+        Target models like Gemma3 apply ``hidden_size ** 0.5`` during embedding
+        lookup.  Since the Eagle3 draft model shares the raw (unscaled) weight
+        via ``set_embed()``, the same scale must be applied in the draft
+        forward pass to keep hidden-state magnitudes aligned.
+        """
+        self.model.embed_scale = scale
 
 
 EntryClass = [LlamaForCausalLMEagle3]
