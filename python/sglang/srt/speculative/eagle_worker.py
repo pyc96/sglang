@@ -169,20 +169,6 @@ class EAGLEWorker(TpModelWorker):
             else:
                 self.draft_model_runner.model.set_embed(embed)
 
-            # Propagate embedding scale from target model to draft model.
-            # Target models like Gemma3/Gemma4 use scaled embeddings
-            # (weight * hidden_size**0.5) but the shared weight is unscaled.
-            target_embed_module = (
-                self.target_worker.model_runner.model.get_input_embeddings()
-            )
-            embed_scale = getattr(target_embed_module, "embed_scale", None)
-            if (
-                embed_scale is not None
-                and embed_scale != 1.0
-                and hasattr(self.draft_model_runner.model, "set_embed_scale")
-            ):
-                self.draft_model_runner.model.set_embed_scale(embed_scale)
-
             # grab hot token ids
             if self.draft_model_runner.model.hot_token_id is not None:
                 self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(

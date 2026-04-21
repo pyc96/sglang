@@ -212,18 +212,6 @@ class EagleDraftWorker(BaseDraftWorker):
             else:
                 self.draft_runner.model.set_embed(embed)
 
-            # Propagate embedding scale from target model to draft model.
-            target_embed_module = (
-                self.target_worker.model_runner.model.get_input_embeddings()
-            )
-            embed_scale = getattr(target_embed_module, "embed_scale", None)
-            if (
-                embed_scale is not None
-                and embed_scale != 1.0
-                and hasattr(self.draft_runner.model, "set_embed_scale")
-            ):
-                self.draft_runner.model.set_embed_scale(embed_scale)
-
             # grab hot token ids
             if self.draft_runner.model.hot_token_id is not None:
                 self.hot_token_id = self.draft_runner.model.hot_token_id.to(

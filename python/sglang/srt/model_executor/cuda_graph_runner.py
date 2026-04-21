@@ -127,7 +127,6 @@ def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -
 
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
-
     input_ids: torch.Tensor
     input_embeds: torch.Tensor
     req_pool_indices: torch.Tensor
@@ -650,7 +649,9 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle3()
             and model_runner.eagle_use_aux_hidden_state
         ):
-            self.model_runner.model.set_eagle3_layers_to_capture()
+            self.model_runner.model.set_eagle3_layers_to_capture(
+                getattr(model_runner, "eagle_aux_hidden_state_layer_ids", None)
+            )
         if (
             model_runner.spec_algorithm.is_dflash()
             and model_runner.dflash_use_aux_hidden_state
@@ -831,9 +832,10 @@ class CudaGraphRunner:
             else:
                 set_pdmux_status(False)
                 for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+                    with (
+                        graph_capture(stream=sg[1]) as graph_capture_context,
+                        profile_context as prof,
+                    ):
                         self.stream = graph_capture_context.stream
                         _capture_one_stream(i)
 
@@ -1097,7 +1099,6 @@ class CudaGraphRunner:
         return graph, out
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
-
         # If the required capture_hidden_mode changes, we need to recapture the graph
 
         # These are the different factors that can influence the capture_hidden_mode

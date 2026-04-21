@@ -129,6 +129,16 @@ class LlamaModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
+        # Embedding scale factor for target models that use scaled embeddings
+        # (e.g., Gemma3/Gemma4 multiply embeddings by hidden_size**0.5).
+        target_type = getattr(config, "target_model_type", None) or ""
+        if getattr(config, "embed_scale", None) is not None:
+            self.embed_scale = config.embed_scale
+        elif "gemma" in target_type:
+            self.embed_scale = config.hidden_size**0.5
+        else:
+            self.embed_scale = 1.0
+
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
         else:
@@ -143,12 +153,6 @@ class LlamaModel(nn.Module):
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-        # Embedding scale factor applied after embed_tokens lookup.
-        # Target models like Gemma3 use scaled embeddings (hidden_size**0.5)
-        # but the weight shared via set_embed() is unscaled.  This attribute
-        # is set by set_embed_scale() after the target model is identified.
-        self.embed_scale = 1.0
 
     def forward(
         self,
@@ -167,12 +171,15 @@ class LlamaModel(nn.Module):
             ):
                 assert embeds is not None
                 embeds = torch.cat(
-                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
+                    [
+                        embeds[:-1],
+                        self.embed_tokens(input_ids[-1].unsqueeze(0))
+                        * self.embed_scale,
+                    ]
                 )
+
             if embeds is None:
-                embeds = self.embed_tokens(input_ids)
-                if self.embed_scale != 1.0:
-                    embeds = embeds * self.embed_scale
+                embeds = self.embed_tokens(input_ids) * self.embed_scale
         else:
             embeds = input_embeds
 
@@ -292,16 +299,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
     def get_hot_token_id(self):
         return self.hot_token_id
-
-    def set_embed_scale(self, scale: float):
-        """Set the embedding scale factor for target models with scaled embeddings.
-
-        Target models like Gemma3 apply ``hidden_size ** 0.5`` during embedding
-        lookup.  Since the Eagle3 draft model shares the raw (unscaled) weight
-        via ``set_embed()``, the same scale must be applied in the draft
-        forward pass to keep hidden-state magnitudes aligned.
-        """
-        self.model.embed_scale = scale
 
 
 EntryClass = [LlamaForCausalLMEagle3]

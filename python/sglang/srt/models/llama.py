@@ -98,8 +98,7 @@ class LlamaMLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -396,6 +395,12 @@ class LlamaModel(nn.Module):
                 residual,
             )
 
+        # Capture the output of the last layer if requested.
+        # layers_to_capture uses +1 offset, so end_layer means
+        # "output of the last layer" which is only available after the loop.
+        if self.end_layer in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states + residual)
+
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -432,7 +437,7 @@ class LlamaModel(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
     def get_input_embeddings(self) -> nn.Embedding:
