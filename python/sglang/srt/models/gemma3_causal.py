@@ -617,6 +617,7 @@ class Gemma3TextModel(PreTrainedModel):
 
         aux_hidden_states = []
 
+        num_layers = len(self.layers)
         if _is_cpu and _is_cpu_amx_available:
             for i, layer in enumerate(self.layers):
                 if i in self.layers_to_capture:
@@ -648,6 +649,12 @@ class Gemma3TextModel(PreTrainedModel):
                     **kwargs,
                 )
                 hidden_states = layer_outputs[0]
+
+        # Capture the output of the last layer if requested.
+        # layers_to_capture uses +1 offset (captures input of layer i = output of i-1),
+        # so index num_layers means the output of the final layer.
+        if num_layers in self.layers_to_capture:
+            aux_hidden_states.append(hidden_states)
 
         hidden_states = self.norm(hidden_states)
 

@@ -211,13 +211,17 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
-        if hidden_states.shape[-1] != embeds.shape[-1]:
-            # Normalize each aux layer independently before fc projection
+        if hidden_states.shape[-1] == self.hidden_size_in * 3:
+            # First step: aux hidden states from 3 target layers (3*H).
+            # Normalize each layer independently before fc projection.
             h_low, h_mid, h_high = hidden_states.split(self.hidden_size_in, dim=-1)
             h_low = self.aux_norm_low(h_low)
             h_mid = self.aux_norm_mid(h_mid)
             h_high = self.aux_norm_high(h_high)
             hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
+            hidden_states = self.fc(hidden_states)
+        elif hidden_states.shape[-1] != embeds.shape[-1]:
+            # Fallback for other sizes (shouldn't happen in normal flow)
             hidden_states = self.fc(hidden_states)
 
         # idle batch
