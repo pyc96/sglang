@@ -124,8 +124,14 @@ class PoolStats:
         stats.full_token_usage = self.full_token_usage
         if self.is_hybrid_swa:
             stats.swa_token_usage = self.swa_token_usage
+            stats.swa_available_tokens = self.swa_available_size
+            stats.swa_evictable_tokens = self.swa_evictable_size
+            stats.swa_used_tokens = self.swa_num_used
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
+            stats.mamba_available_tokens = self.mamba_available_size
+            stats.mamba_evictable_tokens = self.mamba_evictable_size
+            stats.mamba_used_tokens = self.mamba_num_used
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
@@ -165,6 +171,9 @@ class SchedulerRuntimeCheckerMixin:
 
     def _session_held_req_count(self: Scheduler) -> int:
         return self.tree_cache.session_held_req_count()
+
+    def _session_held_mamba_slots(self: Scheduler) -> int:
+        return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
@@ -335,7 +344,7 @@ class SchedulerRuntimeCheckerMixin:
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            0,
+            self._session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -509,7 +518,7 @@ class SchedulerRuntimeCheckerMixin:
         )
         self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
                 self.disagg_prefill_bootstrap_queue.queue, priority_enabled
             )
             self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(

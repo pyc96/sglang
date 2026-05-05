@@ -81,6 +81,10 @@ MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
 )
+LLAMA4_MODEL_ARCHS = (
+    "Llama4ForConditionalGeneration",
+    "Llama4ForCausalLM",
+)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -127,6 +131,7 @@ QUANTIZATION_CHOICES = [
     "auto-round",
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
+    "quark",  # AMD Quark quantizer (FP8 / MXFP4 / Int4FP8 etc.)
     "quark_int4fp8_moe",
     "unquant",
 ]
@@ -184,6 +189,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutedsl",
     "cutlass",
     "aiter",
+    "marlin",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -488,6 +494,7 @@ class ServerArgs:
     experts_shared_outer_loras: Optional[bool] = None
     lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
+    lora_drain_wait_threshold: float = 0.0
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -686,6 +693,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_indexer_topk: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -768,6 +776,9 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+
+    # For communications compression
+    enable_quant_communications: Optional[bool] = False
 
     # For msProbe
     msprobe_dump_config: Optional[str] = None
@@ -1665,6 +1676,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
@@ -1696,7 +1708,7 @@ class ServerArgs:
                     self.attention_backend = "nsa"
                     logger.info("Use nsa attention backend for DeepSeek with DSA.")
 
-                if not is_npu():  # CUDA or ROCm GPU
+                if not is_npu() and not is_xpu():  # CUDA or ROCm GPU
                     if self.enable_nsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
@@ -2034,7 +2046,7 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
                 )
-        elif "Llama4" in model_arch and self.device != "cpu":
+        elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
                 if is_sm100_supported():
@@ -2134,46 +2146,11 @@ class ServerArgs:
                 support_mamba_cache=False,
             )
         elif model_arch in ["NemotronHForCausalLM"]:
-            model_config = self.get_model_config()
-            if model_config.quantization in [
-                "modelopt",
-                "modelopt_fp8",
-                "modelopt_fp4",
-                "modelopt_mixed",
-            ]:
-                assert model_config.hf_config.mlp_hidden_act == "relu2"
-                if model_config.quantization == "modelopt":
-                    quant_algo = model_config.hf_config.quantization_config[
-                        "quant_algo"
-                    ]
-                    if quant_algo == "MIXED_PRECISION":
-                        self.quantization = "modelopt_mixed"
-                    else:
-                        self.quantization = (
-                            "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
-                        )
-                else:
-                    self.quantization = model_config.quantization
-                if self.moe_runner_backend == "auto":
-                    if is_sm100_supported() and self.moe_a2a_backend == "none":
-                        self.moe_runner_backend = "flashinfer_trtllm"
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for "
-                            f"{model_arch}"
-                        )
-                    else:
-                        self.moe_runner_backend = "flashinfer_cutlass"
+            from sglang.srt.arg_groups.nemotron_h_hook import (
+                apply_nemotron_h_defaults,
+            )
 
-            self._handle_mamba_radix_cache(
-                model_arch=model_arch,
-                support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
-                sm100_default_attention_backend="flashinfer",
-            )
-            assert self.attention_backend != "triton", (
-                "NemotronHForCausalLM does not support triton attention backend,"
-                "as the first layer might not be an attention layer"
-            )
+            apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
             "Qwen3MoeForCausalLM",
             "Qwen3VLMoeForConditionalGeneration",
@@ -3736,10 +3713,12 @@ class ServerArgs:
                         "--disaggregation-decode-enable-radix-cache is incompatible "
                         "with --enable-hisparse"
                     )
-                if self.disaggregation_transfer_backend != "nixl":
+                if self.disaggregation_transfer_backend not in ("nixl", "mooncake"):
                     raise ValueError(
                         "--disaggregation-decode-enable-radix-cache currently "
-                        "requires --disaggregation-transfer-backend nixl"
+                        "requires --disaggregation-transfer-backend in "
+                        "('nixl', 'mooncake'), but got "
+                        f"{self.disaggregation_transfer_backend!r}"
                     )
                 if self.speculative_algorithm is not None:
                     raise ValueError(
@@ -5251,6 +5230,12 @@ class ServerArgs:
             help="Enable strict loading for LoRA adapters. "
             "When set, mismatched or missing keys in the adapter weights will raise an error.",
         )
+        parser.add_argument(
+            "--lora-drain-wait-threshold",
+            type=float,
+            default=ServerArgs.lora_drain_wait_threshold,
+            help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -6283,6 +6268,11 @@ class ServerArgs:
             help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
+            "--enable-return-indexer-topk",
+            action="store_true",
+            help="Enable returning indexer topk indices of layers with indexer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -6439,7 +6429,7 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-enable-radix-cache",
             action="store_true",
-            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl and is incompatible with --enable-hisparse.",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl or mooncake and is incompatible with --enable-hisparse.",
         )
         parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
@@ -6648,6 +6638,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        parser.add_argument(
+            "--enable-quant-communications",
+            action="store_true",
+            default=False,
+            help="Enable INT8 quantization of TP communications (limited support).",
         )
 
         # For msProbe
@@ -6925,6 +6922,17 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
+        # Check communications compression
+        if self.enable_quant_communications and self.tp_size == 1:
+            raise ValueError(
+                "Communications quantization is only used with tp_size != 1"
+            )
+
+        if self.enable_quant_communications and self.device != "npu":
+            raise ValueError(
+                "Communications quantization is only supported for NPU device"
+            )
+
         if (
             self.enable_grpc
             and self.grpc_port is not None
@@ -7055,11 +7063,11 @@ class ServerArgs:
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
             if self.lora_use_virtual_experts:
-                assert self.lora_backend == "triton", (
-                    "--lora-use-virtual-experts requires --lora-backend triton. "
-                    f"Got: {self.lora_backend}"
-                )
                 logger.info("Virtual expert computation enabled.")
+
+            assert (
+                self.lora_drain_wait_threshold >= 0.0
+            ), "--lora-drain-wait-threshold must be non-negative."
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
