@@ -5,7 +5,7 @@ import unittest
 import aiohttp
 import numpy as np
 
-from sglang.srt.layers.attention.indexer_topk_capturer import (
+from sglang.srt.state_capturer.indexer_topk import (
     extract_indexer_topk_from_meta_info,
 )
 from sglang.srt.utils import kill_process_tree
@@ -17,7 +17,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=600, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=600, stage="stage-c", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
