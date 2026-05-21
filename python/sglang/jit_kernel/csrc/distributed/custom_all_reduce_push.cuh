@@ -229,7 +229,10 @@ struct CustomAllReducePush : public CustomAllReduceBase {
     RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(device.device_type == kDLCUDA, "Only CUDA device is supported");
     RuntimeCheck(is_type<DType>(input.dtype()), "Input dtype mismatch");
-    RuntimeCheck(std::bit_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
+    // ``reinterpret_cast`` rather than ``std::bit_cast`` so the JIT
+    // builds on libstdc++ < 11 (gcc 10 ships in Debian 11). The cast
+    // is value-equivalent for pointer-to-integer.
+    RuntimeCheck(reinterpret_cast<intptr_t>(input_ptr) % 16 == 0, "Input pointer is not properly aligned");
     RuntimeCheck(m_push_ctrl.has_value(), "Controller is not initialized");
     RuntimeCheck(shot == 1, "Push all-reduce only supports 1-shot, got: ", shot);
     RuntimeCheck(static_cast<int64_t>(num_items) == num_items_int64, "Number of items exceeds 4G limit");
