@@ -2239,6 +2239,42 @@ class ServerArgs:
                         "Use flashinfer_trtllm as MoE runner backend on "
                         "SM100 for Gemma-4 (modelopt_fp4)"
                     )
+
+            # Gemma-4 uses a 25:5 sliding-window : full-attention layer ratio
+            # (see ``Gemma4TextConfig.layer_types``).  The shipped default
+            # ``swa_full_tokens_ratio = 0.8`` is tuned for models where the
+            # sliding-window pool is the binding constraint, but for Gemma-4
+            # the full-attention pool is binding under concurrent long-context
+            # workloads: with the default ratio the full pool only fits ~65
+            # 9k-token requests on a 180 GB B200, forcing partial KV eviction
+            # and re-prefill (visible as ``#cached-token: 1003 #new-token:
+            # 7010`` lines in the serving log) under typical 80-request
+            # summarization loads.
+            #
+            # Lowering the ratio to ~0.15 shifts memory from the over-
+            # provisioned SWA pool (25 layers × 1024-token window) to the
+            # under-provisioned full pool (5 layers × full context length).
+            # On the same 180 GB B200, the full pool grows from ~594 k tokens
+            # to ~2.14 M tokens (3.6× larger; enough for ~237 concurrent
+            # 9k-token requests), while the SWA pool shrinks from ~475 k to
+            # ~321 k tokens (still ~313 concurrent 1024-token windows,
+            # far above any realistic request count).  Median TTFT on a
+            # summarization workload of 80 × 8k-input / 1k-output prompts
+            # drops 16.5 % (10.5 s -> 8.7 s) on a B200 with TP=1, MTP, and
+            # the triton attention backend, with no MMLU regression.
+            #
+            # Only apply when the user did not explicitly set the ratio,
+            # mirroring the pattern in ``apply_deepseek_v4_defaults``.
+            if self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+                self.swa_full_tokens_ratio = 0.15
+                logger.info(
+                    "Setting swa_full_tokens_ratio to "
+                    f"{self.swa_full_tokens_ratio} for {model_arch} "
+                    "(Gemma-4 has a 25:5 SWA:full layer split; the default "
+                    "ratio over-provisions the SWA pool and under-provisions "
+                    "the full-attention pool, causing partial KV eviction "
+                    "and re-prefill under concurrent long-context loads)."
+                )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():
                 self.prefill_attention_backend = "flashinfer"
