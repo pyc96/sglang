@@ -296,10 +296,13 @@ struct FusedParallelQKNormAcrossHead : public CustomAllReduceBase {
     const auto needed_buffer_bytes = static_cast<int64_t>(num_tokens) * 2 * sizeof(float);
     RuntimeCheck(m_num_gpu == kNumGPU, "Number of GPUs mismatch");
     RuntimeCheck(m_push_ctrl.has_value(), "Controller is not initialized");
-    RuntimeCheck(std::bit_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");
-    RuntimeCheck(std::bit_cast<intptr_t>(params.k_ptr) % 16 == 0, "k pointer is not properly aligned");
-    RuntimeCheck(std::bit_cast<intptr_t>(params.q_weight) % 16 == 0, "q_weight pointer is not properly aligned");
-    RuntimeCheck(std::bit_cast<intptr_t>(params.k_weight) % 16 == 0, "k_weight pointer is not properly aligned");
+    // ``reinterpret_cast`` rather than ``std::bit_cast`` so the JIT
+    // builds on libstdc++ < 11 (gcc 10 ships in Debian 11). The cast
+    // is value-equivalent for pointer-to-integer.
+    RuntimeCheck(reinterpret_cast<intptr_t>(params.q_ptr) % 16 == 0, "q pointer is not properly aligned");
+    RuntimeCheck(reinterpret_cast<intptr_t>(params.k_ptr) % 16 == 0, "k pointer is not properly aligned");
+    RuntimeCheck(reinterpret_cast<intptr_t>(params.q_weight) % 16 == 0, "q_weight pointer is not properly aligned");
+    RuntimeCheck(reinterpret_cast<intptr_t>(params.k_weight) % 16 == 0, "k_weight pointer is not properly aligned");
     RuntimeCheck(needed_buffer_bytes <= m_push_buffer_bytes, "Push buffer is too small");
 
     LaunchKernel(num_blocks, num_threads, device)  //
