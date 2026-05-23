@@ -25,6 +25,30 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
+# Opt-in debug instrumentation: log when the SWA allocator returns an index
+# >= swa_pool_size.  Backend-independent.  Set ``SGLANG_TRTLLM_MHA_DEBUG=1``
+# to enable.
+#
+# Empirical finding under Gemma-4-E4B-IT + MTP + summarisation 8 k/1 k x 80
+# at SWA usage up to 1.00 (triton backend) and up to 0.85+ (trtllm_mha
+# backend that crashes): this trap **never fires** under either backend, so
+# the SWA allocator is NOT producing OOB indices.  The trtllm_mha crash is
+# downstream of the allocator -- specifically in
+# ``trtllm_mha_backend.init_forward_metadata`` where
+# ``metadata.page_table = req_to_token[req_pool_indices, :max_seq_len_k]``
+# pulls in *trailing* positions past each row's cache_seqlens whose
+# req_to_token entries were never written (= 0).  The translation
+# ``full_to_swa_index_mapping[0]`` is the swa slot assigned to full slot 0
+# at the last alloc; it can address an arbitrary swa page that may or may
+# not be in-bounds.  See crash_repro/TRIAGE_REPORT.md.
+import os as _os
+
+_DEBUG_SWA_ALLOC_OOB = _os.environ.get("SGLANG_TRTLLM_MHA_DEBUG", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 class SWAKVPool(BaseSWAKVPool):
     """KV cache with separate pools for full and SWA attention layers."""
@@ -495,7 +519,50 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
 
+        # DEBUG: instrument SWA allocator OOB writes (independent of
+        # attention backend).  Catches the off-by-one in
+        # alloc_extend_kernel Part 1 (last_loc + 1 + offset overflowing
+        # pool_size when last_loc is near the pool end).  See
+        # crash_repro/TRIAGE_REPORT.md.
+        if _DEBUG_SWA_ALLOC_OOB:
+            self._maybe_log_swa_oob(alloc_swa_indices, "alloc_extend")
+
         return alloc_full_indices
+
+    def _maybe_log_swa_oob(self, alloc_swa_indices: torch.Tensor, ctx: str) -> None:
+        """If any swa index is >= ``self._size_swa``, log + dump."""
+        import os
+        max_val = int(alloc_swa_indices.max().item())
+        if max_val >= self._size_swa:
+            min_val = int(alloc_swa_indices.min().item())
+            dump_dir = os.environ.get(
+                "SGLANG_TRTLLM_MHA_DEBUG_DIR", "/tmp/trtllm_mha_debug"
+            )
+            os.makedirs(dump_dir, exist_ok=True)
+            fn = (
+                f"{dump_dir}/swa_alloc_oob_{ctx}_max{max_val}_size{self._size_swa}_"
+                f"{int(torch.cuda.current_stream().cuda_stream)}.pt"
+            )
+            torch.save(
+                {
+                    "ctx": ctx,
+                    "alloc_swa_indices": alloc_swa_indices.detach().cpu(),
+                    "swa_pool_size": self._size_swa,
+                    "page_size": self.page_size,
+                    "swa_max_value_returned": max_val,
+                    "swa_min_value_returned": min_val,
+                    "oob_count": int((alloc_swa_indices >= self._size_swa).sum().item()),
+                },
+                fn,
+            )
+            msg = (
+                f"[SWA alloc DEBUG] OOB swa index from {ctx}: "
+                f"max={max_val} swa_pool_size={self._size_swa}; "
+                f"first OOB at flat-idx "
+                f"{int((alloc_swa_indices >= self._size_swa).nonzero().flatten()[0].item())}. "
+                f"Dumped to {fn}"
+            )
+            logger.error(msg)
 
     def alloc_extend_swa_tail(
         self,
@@ -589,6 +656,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             )
         else:
             self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+
+        if _DEBUG_SWA_ALLOC_OOB:
+            self._maybe_log_swa_oob(alloc_swa_indices, "alloc_decode")
 
         return alloc_full_indices
 
