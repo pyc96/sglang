@@ -133,6 +133,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         self._swa_kv_pool: Optional[SWAKVPool] = (
             kv_pool if self.use_sliding_window_kv_pool else None
         )
+        # The model has SWA semantics whenever ANY of its layers carries a
+        # sliding window size > 0.  Use ``model_runner.sliding_window_size``
+        # as the canonical signal: model_runner sets it from the model's
+        # ``get_attention_sliding_window_size`` or ``config.sliding_window_size``.
+        # We need this signal *separately* from the SWA-pool detection
+        # because the FROZEN_KV_MTP draft backend's pool starts non-SWA and
+        # gets swapped to the target's SWA pool at forward time; we must
+        # have allocated SWA-page-table buffers BEFORE that swap.
+        _model_sw = getattr(model_runner, "sliding_window_size", None)
+        self.model_has_sliding_window: bool = (
+            _model_sw is not None and _model_sw > 0
+        )
 
         # Forward metadata
         self.forward_metadata: Optional[TRTLLMMHAMetadata] = None
@@ -161,8 +173,20 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
     ) -> Optional[torch.Tensor]:
-        """Allocate a SWA page_table buffer, or return None for non-SWA models."""
-        if not self.use_sliding_window_kv_pool:
+        """Allocate a SWA page_table buffer, or return None for non-SWA models.
+
+        Note: we eagerly allocate when ``self.model_has_sliding_window`` is
+        true even if ``self.use_sliding_window_kv_pool`` is currently
+        ``False`` at init time.  This is needed for the FROZEN_KV_MTP draft
+        backend: at init it has no SWA pool, but at forward time
+        ``target_kv_pool_view`` swaps in the target's SWA pool (see
+        ``sglang/srt/speculative/frozen_kv_mtp_utils.py``).  Without the
+        pre-allocated buffer the draft backend would build full-pool
+        page_table values for SWA layers and crash the trtllm_mha
+        ``fmhaSm100fKernel_*SlidingOrChunkedCausal*`` kernel with
+        ``Warp Illegal Address``.
+        """
+        if not self.use_sliding_window_kv_pool and not self.model_has_sliding_window:
             return None
         return torch.zeros(max_bs, max_num_pages, dtype=torch.int32, device=self.device)
 
