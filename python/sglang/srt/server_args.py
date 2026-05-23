@@ -2232,10 +2232,70 @@ class ServerArgs:
             )
 
             if is_sm100_supported() and self.moe_runner_backend == "auto":
+                if self.get_model_config().quantization == "modelopt_fp4":
+                    self.quantization = "modelopt_fp4"
+                    self.moe_runner_backend = "flashinfer_trtllm"
+                    logger.info(
+                        "Use flashinfer_trtllm as MoE runner backend on "
+                        "SM100 for Gemma-4 (modelopt_fp4)"
+                    )
 
-                self.moe_runner_backend = "flashinfer_trtllm"
+            # Gemma-4 uses a 5:1 SWA:full-attention layer ratio (see
+            # ``Gemma4TextConfig.layer_types``).  The shipped default
+            # ``swa_full_tokens_ratio = 0.8`` is tuned for models where the
+            # sliding-window pool is the binding constraint, but for the
+            # **MoE** Gemma-4 (``26B-A4B-IT``: 30 layers = 25 SWA + 5 full,
+            # 128 experts top-k 8) the full-attention pool is binding under
+            # concurrent long-context workloads.  Lowering the ratio to
+            # ``0.15`` shifts memory from the over-provisioned SWA pool to
+            # the under-provisioned full pool; median summarization TTFT
+            # drops 16% (10.5 s -> 8.7 s) on B200 with no MMLU regression.
+            #
+            # **Do not apply** this override to dense Gemma-4 variants
+            # (``31B-it``, ``E4B-IT``) — they have less GPU memory free
+            # after model load (dense weights take more RAM than MoE
+            # sparse weights), so the SWA pool becomes critically small
+            # at this ratio and chokes admission under high concurrency.
+            # Empirically: applying ``0.15`` to 31B on B200 with 80
+            # concurrent 1k/1k chat requests caused SWA usage to hit
+            # 100% saturation and dropped output throughput by ~3x.
+            #
+            # MoE detection via ``num_experts`` on the text config — same
+            # pattern used in ``gemma4_causal.py:1166``.  Also keep the
+            # ``apply_deepseek_v4_defaults``-style "respect user override"
+            # predicate (note: the predicate currently can't distinguish
+            # user-passed ``0.8`` from the dataclass default; same caveat
+            # as the upstream DSV4 override).
+            try:
+                _hf_text_config = self.get_model_config().hf_text_config
+            except Exception:
+                _hf_text_config = None
+            _gemma4_num_experts = (
+                int(getattr(_hf_text_config, "num_experts", 0) or 0)
+                if _hf_text_config is not None
+                else 0
+            )
+            _is_gemma4_moe = _gemma4_num_experts > 0
+            if (
+                _is_gemma4_moe
+                and self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio
+            ):
+                self.swa_full_tokens_ratio = 0.15
                 logger.info(
-                    "Use flashinfer_trtllm as MoE runner backend on SM100 for Gemma-4 NVFP4"
+                    "Setting swa_full_tokens_ratio to "
+                    f"{self.swa_full_tokens_ratio} for {model_arch} "
+                    f"(MoE Gemma-4 with num_experts={_gemma4_num_experts}; "
+                    "the default ratio over-provisions the SWA pool and "
+                    "under-provisions the full-attention pool, causing "
+                    "partial KV eviction and re-prefill under concurrent "
+                    "long-context loads)."
+                )
+            elif not _is_gemma4_moe:
+                logger.info(
+                    f"Keeping default swa_full_tokens_ratio="
+                    f"{self.swa_full_tokens_ratio} for {model_arch} "
+                    "(dense Gemma-4; MoE-specific 0.15 override skipped "
+                    "to avoid SWA pool starvation)."
                 )
         elif model_arch == "MossVLForConditionalGeneration":
             if self.is_attention_backend_not_set():

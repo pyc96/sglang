@@ -303,10 +303,21 @@ class FrozenKVMTPCudaGraphRunner:
         # Swap the draft backend's token_to_kv_pool to the frozen target pool
         # for the capture; the single backend-attr swap is seen by both
         # ``get_token_to_kv_pool()`` (via ``get_attn_backend()``) and the
-        # backend's own reads.
+        # backend's own reads.  Also swap SWA-aware backend state so
+        # SWA-aware backends (notably trtllm_mha) build SWA-aware metadata
+        # against the target's SWA pool.  See
+        # ``frozen_kv_mtp_utils._maybe_swap_swa_state``.
+        from sglang.srt.speculative.frozen_kv_mtp_utils import (
+            _maybe_swap_swa_state,
+            _restore_swa_state,
+        )
+
         target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
+        saved_swa_state = _maybe_swap_swa_state(
+            self.draft_attn_backend, target_pool
+        )
         try:
             with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
@@ -319,6 +330,7 @@ class FrozenKVMTPCudaGraphRunner:
                 )
         finally:
             self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
+            _restore_swa_state(self.draft_attn_backend, saved_swa_state)
         set_global_graph_memory_pool(graph.pool())
         return graph, out
 
