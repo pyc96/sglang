@@ -175,6 +175,7 @@ class ModelConfig:
         language_only: bool = False,
         disable_hybrid_swa_memory: bool = False,
         model_config_parser: str = "auto",
+        kv_sharing_fast_prefill: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -187,6 +188,10 @@ class ModelConfig:
         self.is_multi_layer_eagle = is_multi_layer_eagle
         self.disable_hybrid_swa_memory = disable_hybrid_swa_memory
         self.model_config_parser = model_config_parser
+        # YOCO fast-prefill opt-in flag; consumed by models with
+        # ``num_kv_shared_layers > 0`` (e.g. Gemma-4).  See
+        # ``ServerArgs.kv_sharing_fast_prefill`` for full semantics.
+        self.kv_sharing_fast_prefill = kv_sharing_fast_prefill
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
@@ -408,6 +413,7 @@ class ModelConfig:
             is_draft_model=is_draft_model,
             disable_hybrid_swa_memory=server_args.disable_hybrid_swa_memory,
             model_config_parser=server_args.model_config_parser,
+            kv_sharing_fast_prefill=server_args.kv_sharing_fast_prefill,
             **kwargs,
         )
 
