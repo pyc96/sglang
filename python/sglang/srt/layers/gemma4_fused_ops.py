@@ -455,3 +455,140 @@ def gemma4_fused_routing(
         num_warps=1,
     )
     return topk_weights, topk_ids
+
+
+# ---------------------------------------------------------------------------
+# Fused ops for the Per-Layer-Embedding (PLE) tail of Gemma4 E2B / E4B.
+#
+# The slow path in Gemma4DecoderLayer.forward (the PLE branch, taken when
+# `has_ple=True`) used to issue 7 separate kernels at the end of every layer
+# (post_ff_norm; add residual; gate gelu; mul ple; project; norm; add+mul).
+# Two of those (the gate and projection GEMMs) are unavoidable, but the
+# remaining 5 are pointwise across the per-token dim and can be collapsed
+# into 3 Triton launches:
+#
+#   `gemma_rmsnorm_add`        : out = rmsnorm(x, w) + r
+#   `gemma_gelu_tanh_mul`      : out = gelu_tanh(gate) * per_layer_input
+#   `gemma_rmsnorm_residual_scalar` (already defined above) for the tail
+#
+# This saves ~4 kernel launches per layer * num_layers per decode step.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gemma_rmsnorm_add_kernel(
+    X_ptr,
+    W_ptr,
+    Residual_ptr,
+    Out_ptr,
+    stride_x,
+    stride_r,
+    stride_o,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: out = rmsnorm(x, w) + residual.
+
+    Identical to `_gemma_rmsnorm_residual_kernel` with HAS_SCALAR=False.
+    Hoisted into its own kernel so the caller doesn't pay for the
+    `tl.load(Scalar_ptr)` of a unit scalar.
+    """
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    x = tl.load(X_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(Residual_ptr + row * stride_r + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    var = tl.sum(x * x, axis=0) / N
+    out = x * tl.rsqrt(var + eps) * w + r
+    tl.store(Out_ptr + row * stride_o + cols, out.to(x.dtype), mask=mask)
+
+
+def gemma_rmsnorm_add(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    residual: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Fused (rmsnorm(x, w) + residual) — no scalar multiply."""
+    assert x.dim() == 2 and x.stride(-1) == 1, "Expected contiguous 2D input"
+    M, N = x.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    out = torch.empty_like(x)
+
+    _gemma_rmsnorm_add_kernel[(M,)](
+        x,
+        weight,
+        residual,
+        out,
+        x.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        N,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out
+
+
+@triton.jit
+def _gemma_gelu_tanh_mul_kernel(
+    Gate_ptr,
+    Ple_ptr,
+    Out_ptr,
+    stride_g,
+    stride_p,
+    stride_o,
+    N,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused kernel: out = gelu_tanh(gate) * per_layer_input."""
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    gate = tl.load(Gate_ptr + row * stride_g + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    ple = tl.load(Ple_ptr + row * stride_p + cols, mask=mask, other=0.0).to(tl.float32)
+
+    # GeLU with tanh approximation:
+    #   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    SQRT_2_OVER_PI = 0.7978845608028654  # sqrt(2 / pi)
+    inner = SQRT_2_OVER_PI * (gate + 0.044715 * gate * gate * gate)
+    gelu = 0.5 * gate * (1.0 + tl.extra.libdevice.tanh(inner))
+
+    out = gelu * ple
+    tl.store(Out_ptr + row * stride_o + cols, out.to(gate.dtype), mask=mask)
+
+
+def gemma_gelu_tanh_mul(
+    gate: torch.Tensor,
+    per_layer_input: torch.Tensor,
+) -> torch.Tensor:
+    """Fused (gelu_tanh(gate) * per_layer_input) — pointwise."""
+    assert gate.dim() == 2 and gate.stride(-1) == 1, "Expected contiguous 2D gate"
+    assert (
+        per_layer_input.dim() == 2 and per_layer_input.stride(-1) == 1
+    ), "Expected contiguous 2D per_layer_input"
+    assert gate.shape == per_layer_input.shape, "gate / ple must match"
+    M, N = gate.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
+    out = torch.empty_like(gate)
+
+    _gemma_gelu_tanh_mul_kernel[(M,)](
+        gate,
+        per_layer_input,
+        out,
+        gate.stride(0),
+        per_layer_input.stride(0),
+        out.stride(0),
+        N,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return out

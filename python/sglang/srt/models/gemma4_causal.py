@@ -32,7 +32,9 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
+    gemma_gelu_tanh_mul,
     gemma_qkv_rmsnorm,
+    gemma_rmsnorm_add,
     gemma_rmsnorm_residual_scalar,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -714,6 +716,57 @@ class Gemma4DecoderLayer(nn.Module):
                 self.layer_scalar,
                 norm.variance_epsilon,
             )
+        elif (
+            self.has_ple
+            and per_layer_input is not None
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+        ):
+            # ---- PLE fast path (Gemma4 E2B / E4B) ----------------------
+            #
+            # Baseline issued 7 launches per layer for the tail
+            # (post_ff_norm; add residual; gate gelu; mul ple; project;
+            # norm; add+mul). Fuse the 5 pointwise ones into 3 Triton
+            # kernels around the two unavoidable GEMMs.
+            #
+            #   step                              kernels in baseline   here
+            #   --------------------------------- ------------------    ----
+            #   post_ff_norm(h) + residual        rmsnorm + add         1   (gemma_rmsnorm_add)
+            #   gate = ple_gate(h_post)            GEMM                  GEMM (unchanged)
+            #   gelu(gate) * per_layer_input      gelu + mul            1   (gemma_gelu_tanh_mul)
+            #   c = ple_proj(gated)               GEMM                  GEMM (unchanged)
+            #   (norm(c) + h_post) * layer_scalar rmsnorm + add + mul   1   (gemma_rmsnorm_residual_scalar)
+            #
+            # Total saved: 4 launches per layer per decode step.
+            norm_post_ff = self.post_feedforward_layernorm
+            hidden_post = gemma_rmsnorm_add(
+                hidden_states,
+                norm_post_ff.weight.data,
+                residual,
+                norm_post_ff.variance_epsilon,
+            )
+
+            gate, _ = self.per_layer_input_gate(hidden_post)
+            gated_per_layer = gemma_gelu_tanh_mul(gate, per_layer_input)
+            per_layer_contribution, _ = self.per_layer_projection(gated_per_layer)
+
+            norm_ple = self.post_per_layer_input_norm
+            # Gemma4RMSNorm uses `eps` (and supports a scale_shift; we fall
+            # back to the slow path when scale_shift is non-zero, since the
+            # fused kernel assumes standard RMSNorm semantics).
+            if norm_ple.scale_shift == 0.0:
+                hidden_states = gemma_rmsnorm_residual_scalar(
+                    per_layer_contribution,
+                    norm_ple.weight.data,
+                    hidden_post,
+                    self.layer_scalar,
+                    norm_ple.eps,
+                )
+            else:
+                per_layer_contribution = norm_ple(per_layer_contribution)
+                hidden_states = (
+                    hidden_post + per_layer_contribution
+                ) * self.layer_scalar
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = hidden_states + residual

@@ -1314,8 +1314,23 @@ class ServerArgs:
         if self.lora_paths or self.enable_lora:
             self.disable_piecewise_cuda_graph = True
         # 8. Multimodal / VLM models
+        #
+        # The piecewise CUDA graph runner extracts `model.language_model`
+        # explicitly (see piecewise_cuda_graph_runner::__init__) so
+        # language-only decode forwards capture cleanly even when a vision
+        # tower is present, but a number of vision-token slicing code paths
+        # (e.g. SWA radix cache reshuffling) trigger CUDA illegal accesses
+        # under capture. Keep the blanket disable as the default, but allow
+        # opt-in via `SGLANG_ENABLE_PIECEWISE_CUDA_GRAPH_FOR_MM=1` so MM
+        # models with no `num_kv_shared_layers` (Gemma-4-26B-A4B-IT,
+        # gemma-4-31B-it) can pick up the prefill capture without users
+        # having to set --enforce-piecewise-cuda-graph (which also bypasses
+        # other safety nets).
+        import os
+
         if self.get_model_config().is_multimodal:
-            self.disable_piecewise_cuda_graph = True
+            if os.environ.get("SGLANG_ENABLE_PIECEWISE_CUDA_GRAPH_FOR_MM", "0") != "1":
+                self.disable_piecewise_cuda_graph = True
         # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
         if (
             self.load_format == "gguf"
