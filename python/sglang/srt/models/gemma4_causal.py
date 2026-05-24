@@ -50,7 +50,12 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
+from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -843,6 +848,35 @@ class Gemma4TextModel(PreTrainedModel):
         else:
             self.norm = PPMissingLayer()
         self.layers_to_capture = []
+
+        # KV-sharing fast-prefill (YOCO) configuration.  When the user opts
+        # into ``--kv-sharing-fast-prefill`` and the served model declares
+        # ``num_kv_shared_layers > 0``, EXTEND-mode forwards split the layer
+        # loop into a self-decoder (layers ``[0, first_kv_shared_layer_idx)``)
+        # that runs on the full extend-token batch, and a cross-decoder
+        # (layers ``[first_kv_shared_layer_idx, num_hidden_layers)``) that
+        # runs only on the per-request last-extend-token rows.  The cross-
+        # decoder output is scattered back into a full-shape hidden_states
+        # tensor so downstream consumers (LogitsProcessor, frozen-KV MTP
+        # worker) see the same ``[T, H]`` contract.  Modeled after vLLM's
+        # ``Gemma4Model.fast_prefill_forward``
+        # (vllm/model_executor/models/gemma4.py:1190-1273), reimplemented in
+        # SGLang's own forward + attention-metadata abstractions.
+        self._num_kv_shared_layers = int(
+            getattr(config, "num_kv_shared_layers", 0) or 0
+        )
+        self._first_kv_shared_layer_idx = (
+            config.num_hidden_layers - self._num_kv_shared_layers
+        )
+        try:
+            _server_args = get_global_server_args()
+        except Exception:
+            _server_args = None
+        self._kv_sharing_fast_prefill_enabled = (
+            bool(getattr(_server_args, "kv_sharing_fast_prefill", False))
+            and self._num_kv_shared_layers > 0
+        )
+
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -919,6 +953,128 @@ class Gemma4TextModel(PreTrainedModel):
         # Combine: (projection + per_layer_inputs) * scale
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
+    # -- KV-sharing fast-prefill (YOCO) helpers ----------------------------
+
+    def _can_run_yoco(self, forward_batch: ForwardBatch) -> bool:
+        """Predicate for the YOCO fast-prefill branch.
+
+        Returns True only when (a) the flag is on, (b) the model declares
+        KV-shared layers, (c) the batch is in EXTEND mode (and not
+        TARGET_VERIFY), (d) ``extend_seq_lens`` is populated, (e) the model
+        does not use PLE (gated out for v0 because the per-layer-input slice
+        would need its own gather), and (f) no request in the batch asks
+        for input-token logprobs (the LM-head gather then differs from the
+        per-request last-extend-token gather YOCO produces).
+        """
+        if not self._kv_sharing_fast_prefill_enabled:
+            return False
+        if forward_batch.extend_seq_lens is None:
+            return False
+        mode = forward_batch.forward_mode
+        if not mode.is_extend() or mode.is_target_verify():
+            return False
+        # Gate out requests that asked for input-token logprobs: the
+        # LM-head pruning then uses a different index set than the
+        # per-request last-extend-token positions YOCO computes.
+        start_lens = forward_batch.extend_logprob_start_lens_cpu
+        seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        if start_lens and seq_lens_cpu:
+            if any(s < e for s, e in zip(start_lens, seq_lens_cpu)):
+                return False
+        # Gate out Eagle3 aux-hidden-state captures that fall inside the
+        # back half: under YOCO the back-half ``hidden_states`` are gathered
+        # ``[B, H]`` and the captured tensor would be the wrong shape.
+        # Front-half captures (layers in ``[0, first_kv_shared_layer_idx)``)
+        # are still safe and we could allow them, but for v0 we simply
+        # bypass YOCO whenever any capture is requested.
+        if self.layers_to_capture:
+            return False
+        # YOCO touches only the back half; nothing to gain when the model
+        # has only PP first/middle ranks (no back-half layers on this rank)
+        # or when the back-half boundary falls outside the local layer range.
+        if self.end_layer <= self._first_kv_shared_layer_idx:
+            return False
+        if self.start_layer >= self._first_kv_shared_layer_idx:
+            return False
+        return True
+
+    def _build_cross_decoder_last_token_index(
+        self, forward_batch: ForwardBatch
+    ) -> torch.Tensor:
+        """Per-request last-extend-token row index in the flat token buffer.
+
+        Mirrors ``LogitsProcessor._get_pruned_states`` (see
+        ``layers/logits_processor.py``).  Returns an int64 ``[B]`` tensor
+        suitable for fancy-indexing ``hidden_states`` and ``positions``.
+        """
+        padded = forward_batch.padded_static_len
+        if padded is None or padded < 0:
+            return torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+        idx = torch.arange(
+            forward_batch.extend_seq_lens.shape[0],
+            device=forward_batch.extend_seq_lens.device,
+        )
+        return idx * padded + forward_batch.extend_seq_lens - 1
+
+    def _run_cross_decoder_with_yoco(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        last_token_index: torch.Tensor,
+        per_layer_inputs: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Run the cross-decoder (KV-shared) layers on the gathered last-
+        token rows.
+
+        Swaps ``forward_batch.forward_mode`` to ``DECODE`` for the duration
+        of the back-half so the triton attention backend rebuilds its
+        metadata with ``qo_indptr=[0..B]`` (Q has one token per request) and
+        ``kv_indptr=cumsum(seq_lens)`` (K/V covers the full prefix+extend
+        from the donor layer's KV pool).  The original mode and metadata
+        are restored before returning so the caller sees no externally
+        visible mutation.
+
+        When ``per_layer_inputs`` is provided (PLE-enabled variants like
+        Gemma-4 E4B/E2B), the per-layer-input tensor is also gathered to
+        the same rows so the back-half PLE add operates on the correct
+        per-request positions.
+        """
+        attn_backend = get_attn_backend()
+        saved_mode = forward_batch.forward_mode
+        saved_metadata = getattr(attn_backend, "forward_metadata", None)
+
+        gathered_hidden = hidden_states[last_token_index]
+        gathered_positions = positions[last_token_index]
+        gathered_per_layer_inputs = (
+            per_layer_inputs[last_token_index] if per_layer_inputs is not None else None
+        )
+
+        try:
+            forward_batch.forward_mode = ForwardMode.DECODE
+            attn_backend.init_forward_metadata(forward_batch)
+            cross_hidden = gathered_hidden
+            for layer_idx in range(self._first_kv_shared_layer_idx, self.end_layer):
+                if gathered_per_layer_inputs is not None:
+                    per_layer_input = gathered_per_layer_inputs[:, layer_idx, :]
+                else:
+                    per_layer_input = None
+                layer_out = self.layers[layer_idx](
+                    positions=gathered_positions,
+                    hidden_states=cross_hidden,
+                    per_layer_input=per_layer_input,
+                    forward_batch=forward_batch,
+                    **kwargs,
+                )
+                cross_hidden = layer_out[0]
+        finally:
+            forward_batch.forward_mode = saved_mode
+            if saved_metadata is not None:
+                attn_backend.forward_metadata = saved_metadata
+
+        return cross_hidden
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -943,9 +1099,9 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = input_embeds
         else:
-            assert (
-                pp_proxy_tensors is not None
-            ), "pp_proxy_tensors is required on non-first PP ranks"
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
             hidden_states = pp_proxy_tensors["hidden_states"]
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.
@@ -954,7 +1110,17 @@ class Gemma4TextModel(PreTrainedModel):
         aux_hidden_states = []
         num_layers = self.config.num_hidden_layers
 
-        for layer_idx in range(self.start_layer, self.end_layer):
+        # KV-sharing fast-prefill (YOCO) branch — when applicable, run the
+        # back-half (KV-shared) layers only on the per-request last-extend-
+        # token rows and scatter the result back into the full-shape
+        # ``hidden_states`` tensor before the final norm.  See
+        # ``_can_run_yoco`` for the predicate and the audit doc at
+        # ``runs/20260523_gemma4_31b_it_h100_sota_humanize/yoco/draft.md``
+        # for the design rationale.
+        use_yoco = self.pp_group.is_last_rank and self._can_run_yoco(forward_batch)
+        loop_end = self._first_kv_shared_layer_idx if use_yoco else self.end_layer
+
+        for layer_idx in range(self.start_layer, loop_end):
             if layer_idx in self.layers_to_capture:
                 aux_hidden_states.append(hidden_states)
 
@@ -973,6 +1139,32 @@ class Gemma4TextModel(PreTrainedModel):
             hidden_states = layer_outputs[0]
             # Gemma4DecoderLayer.forward always returns (hidden_states, None);
             # the residual is fused inside the layer, so nothing to thread.
+
+        if use_yoco:
+            # Gather per-request last-extend-token rows, run the KV-shared
+            # back half on the reduced batch, then scatter the cross-decoder
+            # output back into a full-shape ``hidden_states`` tensor so the
+            # downstream final norm + LM head + frozen-KV MTP worker see
+            # the existing ``[T, H]`` contract.  Only the gathered rows
+            # carry post-cross-decoder values; non-gathered rows retain
+            # their pre-cross-decoder (self-decoder output) values, which
+            # is harmless because the sampler reads only the gathered rows
+            # (see LogitsProcessor._get_pruned_states).
+            last_token_index = self._build_cross_decoder_last_token_index(forward_batch)
+            cross_hidden = self._run_cross_decoder_with_yoco(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                last_token_index=last_token_index,
+                per_layer_inputs=per_layer_inputs,
+                **kwargs,
+            )
+            # Clone the self-decoder output before scattering so we never
+            # alias a tensor that downstream consumers (CUDA-graph output
+            # buffers) may have weakly referenced.
+            full_hidden = hidden_states.clone()
+            full_hidden.index_copy_(0, last_token_index, cross_hidden)
+            hidden_states = full_hidden
 
         if not self.pp_group.is_last_rank:
             # cuda_graph_runner allocates a fixed PP-proxy schema of
