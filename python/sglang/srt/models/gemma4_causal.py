@@ -30,6 +30,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    gemma4_arf_rmsnorm_only,
+    gemma4_arf_rmsnorm_residual_scalar,
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_gelu_tanh_mul,
@@ -411,6 +413,7 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
         **kwargs,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -495,7 +498,14 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
+        # ARF-fast-path: when the caller signals it will fuse the
+        # ``o_proj`` TP all-reduce with the downstream
+        # ``post_attention_layernorm`` via
+        # ``gemma4_arf_rmsnorm_only``, ``o_proj`` must NOT do its own
+        # all-reduce (otherwise the gradient is double-reduced).  Safe
+        # default ``skip_all_reduce=False`` preserves current behavior
+        # for all non-ARF callers.
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
 
         return output
 
@@ -625,6 +635,22 @@ class Gemma4DecoderLayer(nn.Module):
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
 
+        # FlashInfer AR+RMSNorm fusion opt-in (PR-B/2 of the Gemma-4 ARF
+        # stack).  Cache the server-arg flag at __init__ time to avoid a
+        # per-step lookup; the actual runtime gate also checks
+        # ``apply_flashinfer_allreduce_fusion(num_tokens)`` inside
+        # ``gemma4_arf_rmsnorm_residual_scalar``.  ARF is only wired into
+        # the dense (non-MoE, non-PLE) post-FF combine in v0.
+        try:
+            _server_args = get_global_server_args()
+        except Exception:
+            _server_args = None
+        self._arf_enabled = (
+            bool(getattr(_server_args, "enable_flashinfer_allreduce_fusion", False))
+            and not self.enable_moe_block
+            and not self.has_ple
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -648,11 +674,39 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
+        # ARF (FlashInfer AR+RMSNorm fusion) and the MoE-branch triple-rmsnorm
+        # fusion (PR #16) are predicate-disjoint:
+        #   * ARF fires only when ``self._arf_enabled`` (requires non-MoE,
+        #     non-PLE, ``--enable-flashinfer-allreduce-fusion``).
+        #   * The MoE triple-rmsnorm fusion below absorbs the AR + post-attn
+        #     RMSNorm into a single kernel and runs only when
+        #     ``enable_moe_block=True``.
+        # On the dense path, ``skip_all_reduce=self._arf_enabled`` lets the
+        # downstream ``gemma4_arf_rmsnorm_only`` perform the all-reduce
+        # inside FlashInfer's fused kernel.  On the MoE path the
+        # ``attn_out`` is forwarded raw to ``gemma_post_attn_triple_rmsnorm``
+        # which does its own AR-folding via the existing
+        # ``RowParallelLinear.all_reduce`` semantics (``skip_all_reduce``
+        # stays ``False`` because MoE excludes ARF).
         attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            skip_all_reduce=self._arf_enabled,
         )
+        if self.enable_moe_block:
+            # MoE path: triple-rmsnorm fusion (below) handles the post-attn
+            # AR + RMSNorm + residual-add internally.  Do not touch
+            # ``attn_out`` here.
+            pass
+        elif self._arf_enabled:
+            # Dense path with ARF: fuse the o_proj AR with
+            # post_attention_layernorm via FlashInfer's kARResidualRMSNorm
+            # (zero-residual trick).
+            attn_out = gemma4_arf_rmsnorm_only(
+                attn_out,
+                self.post_attention_layernorm,
+            )
 
         if self.enable_moe_block:
             # ---- vLLM-Inductor-style triple-rmsnorm fusion ---------------
@@ -752,9 +806,14 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_states = hidden_states_1 + hidden_states_2
         else:
             # Non-MoE dense branch — no triple-rmsnorm fusion (only one
-            # downstream norm). Apply post_attn_layernorm explicitly, then
-            # the existing fused pre_feedforward_layernorm(h, residual).
-            hidden_states = self.post_attention_layernorm(attn_out)
+            # downstream norm). When ARF is on, ``attn_out`` already holds
+            # the post_attention_layernorm output (computed inside
+            # ``gemma4_arf_rmsnorm_only`` above); skip the explicit
+            # post_attention_layernorm call to avoid double-normalising.
+            if self._arf_enabled:
+                hidden_states = attn_out
+            else:
+                hidden_states = self.post_attention_layernorm(attn_out)
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
@@ -1189,9 +1248,9 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = input_embeds
         else:
-            assert (
-                pp_proxy_tensors is not None
-            ), "pp_proxy_tensors is required on non-first PP ranks"
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
             hidden_states = pp_proxy_tensors["hidden_states"]
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.
