@@ -2522,10 +2522,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_been_filtered = v1_spec_info_filtered and not self.is_spec_v2
 
         if self.spec_info:
-            self.spec_info.filter_batch(
-                new_indices=keep_indices_device,
-                has_been_filtered=has_been_filtered,
-            )
+            # Same protection rationale as in `merge_batch` below:
+            # `self.spec_info` may transiently be a `*VerifyInput` /
+            # `*DraftExtendInput` in FROZEN_KV_MTP, neither of which
+            # implements `filter_batch`. After filtering, the merged batch
+            # routes back through `forward_target_extend ->
+            # forward_draft_extend` which rebuilds `batch.spec_info` from
+            # scratch, so the stale fields are discarded.
+            if hasattr(self.spec_info, "filter_batch"):
+                self.spec_info.filter_batch(
+                    new_indices=keep_indices_device,
+                    has_been_filtered=has_been_filtered,
+                )
 
     def merge_batch(self, other: "ScheduleBatch"):
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -2571,7 +2579,25 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.is_prefill_only = self.is_prefill_only and other.is_prefill_only
 
         if self.spec_info:
-            self.spec_info.merge_batch(other.spec_info)
+            # Only merge if `self.spec_info` actually exposes `merge_batch`.
+            # The merge happens at the scheduler level when a new prefill
+            # batch joins a running decode batch. In FROZEN_KV_MTP (and any
+            # other eagle-derived path), `self.spec_info` may transiently
+            # be a `*VerifyInput` or `*DraftExtendInput` rather than a
+            # `*DraftInput` — only `EagleDraftInput` (and its subclasses)
+            # implement `merge_batch`. After the merge, the resulting batch
+            # has `forward_mode in {EXTEND, MIXED}`, which routes the worker
+            # to `forward_target_extend -> forward_draft_extend`, which
+            # rebuilds `batch.spec_info` from scratch — so the contents of
+            # the pre-merge `spec_info` are discarded either way.
+            #
+            # Silently skipping the merge when `merge_batch` is unavailable
+            # prevents the AttributeError that otherwise crashes the
+            # scheduler under concurrent serving (reproducible with the
+            # 30-prompt MM color-naming test on Gemma-4-26B-A4B-IT +
+            # FROZEN_KV_MTP).
+            if hasattr(self.spec_info, "merge_batch"):
+                self.spec_info.merge_batch(other.spec_info)
 
     def copy(self):
         # Only contain fields that will be used by process_batch_result.
