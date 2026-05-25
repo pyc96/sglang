@@ -33,6 +33,7 @@ from sglang.srt.layers.gemma4_fused_ops import (
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_gelu_tanh_mul,
+    gemma_post_attn_triple_rmsnorm,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_add,
     gemma_rmsnorm_residual_scalar,
@@ -646,30 +647,79 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.enable_moe_block:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            # Also need raw (unfused) residual for router and pre_ff_norm_2
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+            # ---- vLLM-Inductor-style triple-rmsnorm fusion ---------------
+            # Replaces:
+            #   hidden = post_attention_layernorm(attn_out)              # rmsnorm
+            #   hidden, residual = pre_feedforward_layernorm(hidden, residual)  # add+rmsnorm
+            #   router_in = norm(residual) * router._fused_scale           # rmsnorm+mul
+            #   moe_in    = pre_feedforward_layernorm_2(residual)          # rmsnorm
+            # (four launches, three of which share the same variance of
+            # `residual = rmsnorm(attn_out, w_post_attn) + old_residual`)
+            # with a single Triton kernel that walks the row twice for
+            # reductions plus once for production — matching the kernel
+            # vLLM Inductor produces (see analysis/fusion_catalog.md).
+            #
+            # Eligibility:
+            #   * 2D contiguous bf16 hidden_states (the common decode path)
+            #   * Gemma4Router with with_scale=False norm (the canonical
+            #     Gemma4 MoE setup; check by reading router.norm.with_scale)
+            #   * router._fused_scale already populated (we trigger this
+            #     lazily on the very first call).
+            router_norm_no_scale = (
+                hasattr(self, "router")
+                and hasattr(self.router, "norm")
+                and getattr(self.router.norm, "with_scale", True) is False
             )
-            # For MoE: router and pre_ff_norm_2 need the unfused residual
-            # (which is now updated to post_attn_out + old_residual)
-            moe_input = residual
-
-            # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
-
-            # MoE branch: router sees residual (= post_attn_out + old_residual)
-            router_logits = self.router(moe_input)
-            hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
-            hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            can_fuse_triple = (
+                attn_out.is_cuda
+                and attn_out.dim() == 2
+                and attn_out.stride(-1) == 1
+                and router_norm_no_scale
+            )
+            if can_fuse_triple:
+                # Make sure router._fused_scale is ready (the kernel needs
+                # it as a single pre-multiplied tensor of shape [H]).
+                if self.router._fused_scale is None:
+                    self.router.fuse_scale()
+                (
+                    residual,
+                    router_in,
+                    hidden_states,
+                    hidden_states_2,
+                ) = gemma_post_attn_triple_rmsnorm(
+                    attn_out,
+                    self.post_attention_layernorm.weight.data,
+                    residual,
+                    self.router._fused_scale.to(attn_out.dtype),
+                    self.pre_feedforward_layernorm.weight.data,
+                    self.pre_feedforward_layernorm_2.weight.data,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                )
+                moe_input = residual
+                # Router: only the proj GEMM remains.
+                router_logits, _ = self.router.proj(router_in)
+                # Dense MLP branch
+                hidden_states_1 = self.mlp(hidden_states)
+                # MoE branch
+                hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            else:
+                # Fallback: the original 4-launch sequence.
+                hidden_states = self.post_attention_layernorm(attn_out)
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
+                moe_input = residual
+                hidden_states_1 = self.mlp(hidden_states)
+                router_logits = self.router(moe_input)
+                hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
+                hidden_states_2 = self.moe(hidden_states_2, router_logits)
 
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
@@ -700,7 +750,10 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+            # Non-MoE dense branch — no triple-rmsnorm fusion (only one
+            # downstream norm). Apply post_attn_layernorm explicitly, then
+            # the existing fused pre_feedforward_layernorm(h, residual).
+            hidden_states = self.post_attention_layernorm(attn_out)
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )

@@ -124,3 +124,56 @@ if __name__ == "__main__":
     import sys
 
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ----------------------------------------------------------------------------
+# Triple-RMSNorm-with-shared-residual kernel (MoE pre-MLP block, see
+# gemma4_fused_ops.gemma_post_attn_triple_rmsnorm). Ported from vLLM
+# Inductor's ``triton_red_fused_add_moe_forward_mul_rms_norm_0``.
+# ----------------------------------------------------------------------------
+
+
+from sglang.srt.layers.gemma4_fused_ops import gemma_post_attn_triple_rmsnorm
+
+
+@pytest.mark.parametrize("M,N", [(1, 2816), (8, 2816), (32, 2816), (3, 5376)])
+def test_post_attn_triple_rmsnorm(M: int, N: int):
+    """Triple-RMSNorm fusion: post_attn_norm(attn) + residual produces a
+    shared base; three downstream norms reuse the same variance."""
+    torch.manual_seed(0)
+    attn_out = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    post_attn_w = torch.randn(N, dtype=torch.bfloat16, device="cuda") * 0.1
+    residual = torch.randn(M, N, dtype=torch.bfloat16, device="cuda")
+    router_fused = torch.randn(N, dtype=torch.bfloat16, device="cuda") * 0.05
+    pre_ff_w = torch.randn(N, dtype=torch.bfloat16, device="cuda") * 0.1
+    pre_ff2_w = torch.randn(N, dtype=torch.bfloat16, device="cuda") * 0.1
+    eps = 1e-6
+
+    # Reference (matches SGLang's eager path semantics):
+    def rmsnorm(x, w, eps=1e-6):
+        var = x.float().pow(2).mean(-1, keepdim=True)
+        return (x.float() * torch.rsqrt(var + eps) * w.float()).to(x.dtype)
+
+    ref_post_attn_normed = rmsnorm(attn_out, post_attn_w, eps)
+    ref_post_attn_res = ref_post_attn_normed + residual
+    # Shared variance for the 3 downstream norms
+    var_par = ref_post_attn_res.float().pow(2).mean(-1, keepdim=True)
+    base = ref_post_attn_res.float() * torch.rsqrt(var_par + eps)
+    ref_router_in = (base * router_fused.float()).to(torch.bfloat16)
+    ref_dense_in = (base * pre_ff_w.float()).to(torch.bfloat16)
+    ref_moe_in = (base * pre_ff2_w.float()).to(torch.bfloat16)
+
+    par, ri, dfi, mi = gemma_post_attn_triple_rmsnorm(
+        attn_out, post_attn_w, residual, router_fused, pre_ff_w, pre_ff2_w, eps=eps
+    )
+
+    # All four outputs match the eager reference within bf16 precision.
+    for name, ref, out in [
+        ("post_attn_res", ref_post_attn_res, par),
+        ("router_in", ref_router_in, ri),
+        ("dense_ff_in", ref_dense_in, dfi),
+        ("moe_in", ref_moe_in, mi),
+    ]:
+        assert torch.allclose(
+            out.float(), ref.float(), atol=5e-2, rtol=5e-2
+        ), f"{name} diff at ({M},{N}): max={ (out.float()-ref.float()).abs().max().item() }"

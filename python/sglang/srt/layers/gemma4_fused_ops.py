@@ -592,3 +592,161 @@ def gemma_gelu_tanh_mul(
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Triple-RMSNorm-with-shared-residual kernel (the MoE-branch pre-MLP block).
+#
+# Ports vLLM Inductor's ``triton_red_fused_add_moe_forward_mul_rms_norm_0``
+# (captured from a torch.compile/Inductor run on Gemma-4-26B-A4B-IT). The
+# pattern Inductor discovered:
+#
+#   1) post_attn_residual = rmsnorm(attn_out, w_post_attn) + residual_before
+#   2) dense_ff_in        = rmsnorm(post_attn_residual, w_pre_ff)
+#   3) router_in          = rmsnorm(post_attn_residual, ones) * router_scale
+#   4) moe_in             = rmsnorm(post_attn_residual, w_pre_ff_2)
+#
+# Steps 2, 3 and 4 share the SAME ``rsqrt(variance(post_attn_residual))``;
+# Inductor reuses the reduction across all three outputs. Doing the same
+# in a hand-rolled Triton kernel lets us emit one launch instead of 3-4
+# launches (post_attn_rmsnorm; pre_ff_rmsnorm_with_add; router_norm;
+# pre_ff_2_rmsnorm) without depending on torch.compile.
+#
+# The kernel applies the classic 3-pass-reduction layout the Inductor
+# kernel uses:
+#   pass 1: variance(attn_out)              -> rsqrt for the first rmsnorm
+#   pass 2: variance(rmsnorm(attn_out)+res) -> rsqrt shared by 3 outputs
+#   pass 3: produce the 3 scaled outputs and the updated residual
+#
+# Pre-condition: with_scale=False for the router norm (true for Gemma4
+# Gemma4Router). ``router_scale_per_dim`` MUST already be folded with
+# the root_size (i.e. callers pass router._fused_scale, which is
+# scale * hidden_size^{-0.5}).
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _gemma_post_attn_triple_rmsnorm_kernel(
+    Attn_ptr,  # in_ptr0 : [bs, H] bf16
+    PostAttnW_ptr,  # in_ptr1 : [H]    bf16   - post_attention_layernorm weight
+    Residual_ptr,  # in_ptr2 : [bs, H] bf16   - pre-attention residual (input_layernorm input)
+    RouterScale_ptr,  # in_ptr3 : [H]    bf16   - router._fused_scale (= scale * root_size)
+    PreFFW_ptr,  # in_ptr4 : [H]    bf16   - pre_feedforward_layernorm weight
+    PreFF2W_ptr,  # in_ptr5 : [H]    bf16   - pre_feedforward_layernorm_2 weight (MoE)
+    PostAttnResOut_ptr,  # out_ptr0: [bs, H] bf16   - updated residual (= rmsnorm(attn_out)+res)
+    RouterIn_ptr,  # out_ptr1: [bs, H] bf16
+    DenseFFIn_ptr,  # out_ptr2: [bs, H] bf16
+    MoeIn_ptr,  # out_ptr3: [bs, H] bf16
+    stride_attn,
+    stride_res,
+    stride_par,
+    stride_rin,
+    stride_dfn,
+    stride_min,
+    N,
+    eps,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N
+
+    # ---------------- Pass 1: variance(attn_out) -----------------------------
+    a = tl.load(Attn_ptr + row * stride_attn + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    var_a = tl.sum(a * a, axis=0) / N
+    rsqrt_a = tl.rsqrt(var_a + eps)
+
+    # ---------------- Pass 2: build post_attn_residual; variance -------------
+    # rmsnorm(attn_out, w_post_attn) + residual
+    w_post = tl.load(PostAttnW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    res = tl.load(Residual_ptr + row * stride_res + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    post_attn_res = (a * rsqrt_a * w_post) + res
+    var_par = tl.sum(post_attn_res * post_attn_res, axis=0) / N
+    rsqrt_par = tl.rsqrt(var_par + eps)
+
+    # ---------------- Pass 3: produce all three outputs ----------------------
+    # base = rmsnorm(post_attn_res, ones) — shared by all three.
+    base = post_attn_res * rsqrt_par
+
+    rscale = tl.load(RouterScale_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    wff = tl.load(PreFFW_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    wff2 = tl.load(PreFF2W_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    router_out = base * rscale
+    dense_out = base * wff
+    moe_out_val = base * wff2
+
+    # Store. The updated residual is also written so subsequent layers can
+    # read it (downstream code expects the pre-attn residual to be the
+    # post_attn rmsnorm output added to the prior residual).
+    out_dtype = tl.bfloat16
+    tl.store(
+        PostAttnResOut_ptr + row * stride_par + cols,
+        post_attn_res.to(out_dtype),
+        mask=mask,
+    )
+    tl.store(
+        RouterIn_ptr + row * stride_rin + cols, router_out.to(out_dtype), mask=mask
+    )
+    tl.store(
+        DenseFFIn_ptr + row * stride_dfn + cols, dense_out.to(out_dtype), mask=mask
+    )
+    tl.store(MoeIn_ptr + row * stride_min + cols, moe_out_val.to(out_dtype), mask=mask)
+
+
+def gemma_post_attn_triple_rmsnorm(
+    attn_out: torch.Tensor,
+    post_attn_weight: torch.Tensor,
+    residual_before_attn: torch.Tensor,
+    router_fused_scale: torch.Tensor,
+    pre_ff_weight: torch.Tensor,
+    pre_ff_2_weight: torch.Tensor,
+    eps: float = 1e-6,
+):
+    """Fused launcher for the MoE-branch pre-MLP block.
+
+    Returns ``(post_attn_residual, router_input, dense_ff_input, moe_input)``.
+
+    Replaces SGLang's
+        ``hidden = post_attn_norm(attn_out);
+          hidden, residual = pre_ff_norm(hidden, residual);     # fused add+rmsnorm
+          router_in = router.norm(residual) * router._fused_scale;
+          moe_in = pre_ff_2_norm(residual);``
+    with a single Triton kernel that walks the row 3 times for 2 reductions
+    + 1 producer pass, mirroring the Inductor-generated kernel.
+    """
+    assert attn_out.dim() == 2 and attn_out.stride(-1) == 1
+    M, N = attn_out.shape
+    BLOCK_SIZE = triton.next_power_of_2(N)
+
+    post_attn_res = torch.empty_like(attn_out)
+    router_in = torch.empty_like(attn_out)
+    dense_ff_in = torch.empty_like(attn_out)
+    moe_in = torch.empty_like(attn_out)
+
+    _gemma_post_attn_triple_rmsnorm_kernel[(M,)](
+        attn_out,
+        post_attn_weight,
+        residual_before_attn,
+        router_fused_scale,
+        pre_ff_weight,
+        pre_ff_2_weight,
+        post_attn_res,
+        router_in,
+        dense_ff_in,
+        moe_in,
+        attn_out.stride(0),
+        residual_before_attn.stride(0),
+        post_attn_res.stride(0),
+        router_in.stride(0),
+        dense_ff_in.stride(0),
+        moe_in.stride(0),
+        N,
+        eps,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return post_attn_res, router_in, dense_ff_in, moe_in
