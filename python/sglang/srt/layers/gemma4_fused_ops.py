@@ -163,6 +163,70 @@ def gemma4_arf_rmsnorm_residual_scalar(
     return gemma_rmsnorm_residual_scalar(x_reduced, weight, residual, scalar, eps)
 
 
+def gemma4_arf_rmsnorm_only(
+    x: torch.Tensor,
+    norm_module,
+    use_attn_tp_group: bool = True,
+) -> torch.Tensor:
+    """Fused TP all-reduce + single-arg RMSNorm for Gemma-4
+    ``post_attention_layernorm``.
+
+    Numerically equivalent to::
+
+        x_reduced = tensor_model_parallel_all_reduce(x)
+        return norm_module.forward(x_reduced)
+
+    where ``norm_module`` is a standard SGLang ``RMSNorm`` whose math is
+    ``rmsnorm(x) * weight``.  This wrapper is the **correct fusion site**
+    for Gemma-4's residual flow because Gemma-4 places a single-arg
+    RMSNorm immediately after the attention all-reduce (before any
+    residual addition).
+
+    Why the zero-residual trick:
+      FlashInfer's TRT-LLM ``allreduce_fusion`` API only exposes the
+      ``kARResidualRMSNorm`` pattern (no residual-less variant).  vLLM's
+      ``AllReduceRMSNormPattern`` solves this by synthesizing a
+      ``torch.zeros_like(input)`` residual; the math
+      ``rmsnorm(AR(x) + 0) == rmsnorm(AR(x))`` makes the residual
+      contribution vanish.  We follow the same convention here.
+
+    Caller contract:
+      * Caller must pass ``skip_all_reduce=True`` to the upstream
+        ``RowParallelLinear`` whose output is ``x``.
+      * ``x`` must be the still-TP-sharded post-attention projection.
+      * ``norm_module`` is the Gemma-4 layer's
+        ``post_attention_layernorm`` (a ``RMSNorm`` instance — *not* a
+        ``Gemma4RMSNorm``, because the latter's ``(weight + scale_shift)``
+        gamma is not currently expressible in FlashInfer's pattern).
+
+    Fallback: when FlashInfer is unavailable, batch too large, workspace
+    not ready, or the predicate is False, falls back to
+    ``tensor_model_parallel_all_reduce(x) + norm_module.forward(_)`` with
+    bit-identical semantics to the pre-fusion path.
+    """
+    from sglang.srt.distributed import tensor_model_parallel_all_reduce
+    from sglang.srt.layers.communicator import apply_flashinfer_allreduce_fusion
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        flashinfer_allreduce_residual_rmsnorm,
+    )
+
+    if x.is_cuda and x.dim() == 2 and apply_flashinfer_allreduce_fusion(x.shape[0]):
+        zero_residual = torch.zeros_like(x)
+        norm_out, _residual_out = flashinfer_allreduce_residual_rmsnorm(
+            input_tensor=x,
+            residual=zero_residual,
+            weight=norm_module.weight.data,
+            eps=norm_module.variance_epsilon,
+            use_attn_tp_group=use_attn_tp_group,
+        )
+        if norm_out is not None:
+            return norm_out
+
+    # Fallback: identical to the pre-fusion code path.
+    x_reduced = tensor_model_parallel_all_reduce(x)
+    return norm_module.forward(x_reduced)
+
+
 @triton.jit
 def _gemma_dual_rmsnorm_residual_kernel(
     X1_ptr,
