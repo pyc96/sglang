@@ -2631,6 +2631,13 @@ class ServerArgs:
                 "Qwen3_5MoeForConditionalGeneration",
                 "InternS2PreviewForConditionalGeneration",
                 "Qwen3_5ForConditionalGeneration",
+                # Gemma-4 (dense + ConditionalGeneration): the post-FF
+                # combine path opts into ``gemma4_arf_rmsnorm_residual_scalar``
+                # which calls FlashInfer's kARResidualRMSNorm pattern and
+                # then applies the Gemma layer_scalar tail.  See
+                # ``Gemma4DecoderLayer.forward`` in models/gemma4_causal.py.
+                "Gemma4ForCausalLM",
+                "Gemma4ForConditionalGeneration",
             ]
             and (is_sm90_supported() or is_sm100_supported())
             and self.tp_size > 1
