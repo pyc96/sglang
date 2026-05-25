@@ -107,10 +107,18 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul()
         self.prefix = prefix
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip_all_reduce: bool = False) -> torch.Tensor:
+        """Forward pass.
+
+        When ``skip_all_reduce=True``, the ``RowParallelLinear.down_proj``
+        omits its TP all-reduce so the caller can fuse it into a downstream
+        operation (see ``gemma4_arf_rmsnorm_residual_scalar`` for the
+        Gemma-4 post-FF combine fusion).  The default is to all-reduce
+        in-line for back-compat with every other caller.
+        """
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, skip_all_reduce=skip_all_reduce)
         return x
 
 
