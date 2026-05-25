@@ -412,6 +412,10 @@ class Envs:
     # None = standard attention. See https://arxiv.org/abs/2512.12087
     SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
     SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR = EnvFloat(None)
+    # Debug flag: bounds-check trtllm_mha page_table before the kernel call.
+    # Catches OOB SWA page indices that otherwise surface as CUDA illegal
+    # address errors deep inside the attention kernel.  Set to 1 to enable.
+    SGLANG_TRTLLM_MHA_DEBUG = EnvBool(False)
     # TODO(mmangkad): Remove this once the FlashInfer unified allreduce-fusion
     # transport issue on GB200/GB300 platforms is fixed and verified resolved.
     SGLANG_FLASHINFER_FORCE_POSIX_FD_TRANSPORT = EnvBool(None)
