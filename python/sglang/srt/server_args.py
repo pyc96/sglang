@@ -1328,7 +1328,25 @@ class ServerArgs:
         # other safety nets).
         import os
 
-        if self.get_model_config().is_multimodal:
+        # The piecewise CUDA graph runner has known crashes on Gemma-4
+        # under capture (token soup / OOB index errors) -- confirmed on
+        # dense 31B-it under no-MTP, which captures cleanly but generates
+        # garbage tokens.  Treat any Gemma-4 arch the same way as MM
+        # models for PCG-disable purposes unless the user explicitly opts
+        # in via SGLANG_ENABLE_PIECEWISE_CUDA_GRAPH_FOR_MM=1.  This gate
+        # MUST run independently of ``is_multimodal`` because the prior
+        # ``mm_disabled_models`` patch for Gemma-4 (text-only deployment)
+        # makes ``is_multimodal`` False, which would silently re-enable
+        # PCG and reintroduce the token-soup regression.
+        is_gemma4_arch = False
+        try:
+            _archs = (
+                getattr(self.get_model_config().hf_config, "architectures", []) or []
+            )
+            is_gemma4_arch = any(a.startswith("Gemma4") for a in _archs)
+        except Exception:
+            pass
+        if self.get_model_config().is_multimodal or is_gemma4_arch:
             if os.environ.get("SGLANG_ENABLE_PIECEWISE_CUDA_GRAPH_FOR_MM", "0") != "1":
                 self.disable_piecewise_cuda_graph = True
         # 9. GGUF quantized models (custom dequant ops unsupported by torch.compile)
