@@ -30,8 +30,12 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
+    gemma_gelu_tanh_mul,
+    gemma_post_attn_triple_rmsnorm,
     gemma_qkv_rmsnorm,
+    gemma_rmsnorm_add,
     gemma_rmsnorm_residual_scalar,
 )
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
@@ -220,6 +224,20 @@ class Gemma4MoE(nn.Module):
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # softmax(all)[topk] / sum(softmax(all)[topk]) = softmax(topk_logits),
             # so we softmax only the top-k logits (fewer kernel launches).
+            #
+            # Fast path: a single Triton kernel that produces (weights, ids)
+            # already scaled by per_expert_scale.  Mathematically identical
+            # to the torch fallback below.  Active when on CUDA with a 2-D
+            # router-logits tensor and num_experts a power-of-two-rounded
+            # value the kernel supports (always true for Gemma4: E=128).
+            if (
+                gating_output.is_cuda
+                and gating_output.dim() == 2
+                and gating_output.dtype
+                in (torch.float16, torch.bfloat16, torch.float32)
+            ):
+                return gemma4_fused_routing(gating_output, per_expert_scale, topk)
+
             topk_logits, topk_ids = torch.topk(gating_output, k=topk, dim=-1)
             topk_weights = torch.nn.functional.softmax(topk_logits, dim=-1)
 
@@ -629,30 +647,79 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
+        attn_out = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.enable_moe_block:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            # Also need raw (unfused) residual for router and pre_ff_norm_2
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+            # ---- vLLM-Inductor-style triple-rmsnorm fusion ---------------
+            # Replaces:
+            #   hidden = post_attention_layernorm(attn_out)              # rmsnorm
+            #   hidden, residual = pre_feedforward_layernorm(hidden, residual)  # add+rmsnorm
+            #   router_in = norm(residual) * router._fused_scale           # rmsnorm+mul
+            #   moe_in    = pre_feedforward_layernorm_2(residual)          # rmsnorm
+            # (four launches, three of which share the same variance of
+            # `residual = rmsnorm(attn_out, w_post_attn) + old_residual`)
+            # with a single Triton kernel that walks the row twice for
+            # reductions plus once for production — matching the kernel
+            # vLLM Inductor produces (see analysis/fusion_catalog.md).
+            #
+            # Eligibility:
+            #   * 2D contiguous bf16 hidden_states (the common decode path)
+            #   * Gemma4Router with with_scale=False norm (the canonical
+            #     Gemma4 MoE setup; check by reading router.norm.with_scale)
+            #   * router._fused_scale already populated (we trigger this
+            #     lazily on the very first call).
+            router_norm_no_scale = (
+                hasattr(self, "router")
+                and hasattr(self.router, "norm")
+                and getattr(self.router.norm, "with_scale", True) is False
             )
-            # For MoE: router and pre_ff_norm_2 need the unfused residual
-            # (which is now updated to post_attn_out + old_residual)
-            moe_input = residual
-
-            # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
-
-            # MoE branch: router sees residual (= post_attn_out + old_residual)
-            router_logits = self.router(moe_input)
-            hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
-            hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            can_fuse_triple = (
+                attn_out.is_cuda
+                and attn_out.dim() == 2
+                and attn_out.stride(-1) == 1
+                and router_norm_no_scale
+            )
+            if can_fuse_triple:
+                # Make sure router._fused_scale is ready (the kernel needs
+                # it as a single pre-multiplied tensor of shape [H]).
+                if self.router._fused_scale is None:
+                    self.router.fuse_scale()
+                (
+                    residual,
+                    router_in,
+                    hidden_states,
+                    hidden_states_2,
+                ) = gemma_post_attn_triple_rmsnorm(
+                    attn_out,
+                    self.post_attention_layernorm.weight.data,
+                    residual,
+                    self.router._fused_scale.to(attn_out.dtype),
+                    self.pre_feedforward_layernorm.weight.data,
+                    self.pre_feedforward_layernorm_2.weight.data,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                )
+                moe_input = residual
+                # Router: only the proj GEMM remains.
+                router_logits, _ = self.router.proj(router_in)
+                # Dense MLP branch
+                hidden_states_1 = self.mlp(hidden_states)
+                # MoE branch
+                hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            else:
+                # Fallback: the original 4-launch sequence.
+                hidden_states = self.post_attention_layernorm(attn_out)
+                hidden_states, residual = self.pre_feedforward_layernorm(
+                    hidden_states, residual
+                )
+                moe_input = residual
+                hidden_states_1 = self.mlp(hidden_states)
+                router_logits = self.router(moe_input)
+                hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
+                hidden_states_2 = self.moe(hidden_states_2, router_logits)
 
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
@@ -683,7 +750,10 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
+            # Non-MoE dense branch — no triple-rmsnorm fusion (only one
+            # downstream norm). Apply post_attn_layernorm explicitly, then
+            # the existing fused pre_feedforward_layernorm(h, residual).
+            hidden_states = self.post_attention_layernorm(attn_out)
             hidden_states, residual = self.pre_feedforward_layernorm(
                 hidden_states, residual
             )
@@ -699,6 +769,57 @@ class Gemma4DecoderLayer(nn.Module):
                 self.layer_scalar,
                 norm.variance_epsilon,
             )
+        elif (
+            self.has_ple
+            and per_layer_input is not None
+            and hidden_states.is_cuda
+            and hidden_states.dim() == 2
+        ):
+            # ---- PLE fast path (Gemma4 E2B / E4B) ----------------------
+            #
+            # Baseline issued 7 launches per layer for the tail
+            # (post_ff_norm; add residual; gate gelu; mul ple; project;
+            # norm; add+mul). Fuse the 5 pointwise ones into 3 Triton
+            # kernels around the two unavoidable GEMMs.
+            #
+            #   step                              kernels in baseline   here
+            #   --------------------------------- ------------------    ----
+            #   post_ff_norm(h) + residual        rmsnorm + add         1   (gemma_rmsnorm_add)
+            #   gate = ple_gate(h_post)            GEMM                  GEMM (unchanged)
+            #   gelu(gate) * per_layer_input      gelu + mul            1   (gemma_gelu_tanh_mul)
+            #   c = ple_proj(gated)               GEMM                  GEMM (unchanged)
+            #   (norm(c) + h_post) * layer_scalar rmsnorm + add + mul   1   (gemma_rmsnorm_residual_scalar)
+            #
+            # Total saved: 4 launches per layer per decode step.
+            norm_post_ff = self.post_feedforward_layernorm
+            hidden_post = gemma_rmsnorm_add(
+                hidden_states,
+                norm_post_ff.weight.data,
+                residual,
+                norm_post_ff.variance_epsilon,
+            )
+
+            gate, _ = self.per_layer_input_gate(hidden_post)
+            gated_per_layer = gemma_gelu_tanh_mul(gate, per_layer_input)
+            per_layer_contribution, _ = self.per_layer_projection(gated_per_layer)
+
+            norm_ple = self.post_per_layer_input_norm
+            # Gemma4RMSNorm uses `eps` (and supports a scale_shift; we fall
+            # back to the slow path when scale_shift is non-zero, since the
+            # fused kernel assumes standard RMSNorm semantics).
+            if norm_ple.scale_shift == 0.0:
+                hidden_states = gemma_rmsnorm_residual_scalar(
+                    per_layer_contribution,
+                    norm_ple.weight.data,
+                    hidden_post,
+                    self.layer_scalar,
+                    norm_ple.eps,
+                )
+            else:
+                per_layer_contribution = norm_ple(per_layer_contribution)
+                hidden_states = (
+                    hidden_post + per_layer_contribution
+                ) * self.layer_scalar
         else:
             hidden_states = self.post_feedforward_layernorm(hidden_states)
             hidden_states = hidden_states + residual
@@ -1147,7 +1268,8 @@ class Gemma4ForCausalLM(PreTrainedModel):
             ("experts.w13_weight", "experts.gate_up_proj", ("w1", "w3")),
             ("experts.w2_weight", "experts.down_proj", ("w2",)),
         ]
-        num_experts = self.config.num_experts
+        # Dense subclasses (e.g. the Gemma4 MTP assistant) reuse this.
+        num_experts = getattr(self.config, "num_experts", None) or 0
 
         # Per-expert checkpoint format used by compressed-tensors / FP8
         # (e.g. RedHatAI/*-FP8-Dynamic) and by ModelOpt NVFP4
@@ -1159,11 +1281,15 @@ class Gemma4ForCausalLM(PreTrainedModel):
         # in a trailing dot, so the standard `name.replace(weight_name,
         # param_name)` collapses every suffix uniformly to the fused
         # FusedMoE params (experts.w13_*, experts.w2_*).
-        per_expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="gate_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="up_proj",
-            num_experts=num_experts,
+        per_expert_params_mapping = (
+            FusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=num_experts,
+            )
+            if num_experts
+            else []
         )
 
         k_eq_v_layers = self._get_k_eq_v_layers()
