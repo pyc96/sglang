@@ -37,9 +37,24 @@ def _resolve_speculative_algorithm_alias(
 
     if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
         if is_gemma4_draft:
+            # Opt-out: set SGLANG_GEMMA4_FORCE_EAGLE=1 to keep NEXTN/EAGLE
+            # on the upstream EAGLE worker (and skip the FROZEN_KV_MTP
+            # promotion). Useful for A/B testing when FROZEN_KV_MTP's
+            # FrozenKVMTPWorker overhead exceeds its spec-decode gain on
+            # a given workload (see runs/20260525_mtp_comparison/).
+            import os
+
+            if os.environ.get("SGLANG_GEMMA4_FORCE_EAGLE", "0") == "1":
+                logger.info(
+                    "SGLANG_GEMMA4_FORCE_EAGLE=1: keeping "
+                    f"--speculative-algorithm {speculative_algorithm} on the "
+                    "upstream EAGLE worker (skipping FROZEN_KV_MTP promotion)."
+                )
+                return "EAGLE"
             logger.info(
                 "Detected Gemma4AssistantForCausalLM draft; "
-                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
+                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP. "
+                "Set SGLANG_GEMMA4_FORCE_EAGLE=1 to opt out."
             )
             return "FROZEN_KV_MTP"
         return "EAGLE"
