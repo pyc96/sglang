@@ -30,6 +30,8 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import (
+    gemma4_arf_rmsnorm_only,
+    gemma4_arf_rmsnorm_residual_scalar,
     gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
@@ -407,6 +409,7 @@ class Gemma4Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        skip_all_reduce: bool = False,
         **kwargs,
     ):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -491,7 +494,14 @@ class Gemma4Attention(nn.Module):
         )
         if attn_output.dim() == 3:
             attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
+        # ARF-fast-path: when the caller signals it will fuse the
+        # ``o_proj`` TP all-reduce with the downstream
+        # ``post_attention_layernorm`` via
+        # ``gemma4_arf_rmsnorm_only``, ``o_proj`` must NOT do its own
+        # all-reduce (otherwise the gradient is double-reduced).  Safe
+        # default ``skip_all_reduce=False`` preserves current behavior
+        # for all non-ARF callers.
+        output, _ = self.o_proj(attn_output, skip_all_reduce=skip_all_reduce)
 
         return output
 
@@ -621,6 +631,22 @@ class Gemma4DecoderLayer(nn.Module):
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
 
+        # FlashInfer AR+RMSNorm fusion opt-in (PR-B/2 of the Gemma-4 ARF
+        # stack).  Cache the server-arg flag at __init__ time to avoid a
+        # per-step lookup; the actual runtime gate also checks
+        # ``apply_flashinfer_allreduce_fusion(num_tokens)`` inside
+        # ``gemma4_arf_rmsnorm_residual_scalar``.  ARF is only wired into
+        # the dense (non-MoE, non-PLE) post-FF combine in v0.
+        try:
+            _server_args = get_global_server_args()
+        except Exception:
+            _server_args = None
+        self._arf_enabled = (
+            bool(getattr(_server_args, "enable_flashinfer_allreduce_fusion", False))
+            and not self.enable_moe_block
+            and not self.has_ple
+        )
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -644,12 +670,28 @@ class Gemma4DecoderLayer(nn.Module):
 
         # Apply input layernorm
         hidden_states = self.input_layernorm(hidden_states)
+        # ARF fast-path for the post-attention all-reduce + RMSNorm.
+        # When ``self._arf_enabled`` is True, ``self_attn`` skips its
+        # internal ``o_proj`` all-reduce and the downstream
+        # ``gemma4_arf_rmsnorm_only`` calls FlashInfer's TRT-LLM fused
+        # AR+RMSNorm kernel (with a zero residual to satisfy the
+        # FlashInfer API; the residual contribution vanishes
+        # mathematically).  The wrapper falls back to plain
+        # AR + post_attention_layernorm if the runtime predicate is
+        # False (batch too large, FlashInfer unavailable, etc.).
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
+            skip_all_reduce=self._arf_enabled,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        if self._arf_enabled:
+            hidden_states = gemma4_arf_rmsnorm_only(
+                hidden_states,
+                self.post_attention_layernorm,
+            )
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.enable_moe_block:
             # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
@@ -943,9 +985,9 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = input_embeds
         else:
-            assert (
-                pp_proxy_tensors is not None
-            ), "pp_proxy_tensors is required on non-first PP ranks"
+            assert pp_proxy_tensors is not None, (
+                "pp_proxy_tensors is required on non-first PP ranks"
+            )
             hidden_states = pp_proxy_tensors["hidden_states"]
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.
