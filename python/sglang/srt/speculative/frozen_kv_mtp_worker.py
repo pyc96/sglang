@@ -480,6 +480,22 @@ class FrozenKVMTPWorker(TpModelWorker):
                 # `FrozenKVMTPDraftInput` for next iter.
                 batch.spec_info = draft_extend_input
                 self.forward_draft_extend_after_decode(batch)
+            else:
+                # Zero-accept verify path: every draft token was rejected and
+                # no req survives into the next draft. Skipping the seed step
+                # is correct from a compute perspective, but we MUST still
+                # install an idle `FrozenKVMTPDraftInput` so the next iter's
+                # `draft()` sees the expected spec_info type. Otherwise
+                # `batch.spec_info` is left as the prior `FrozenKVMTPVerifyInput`
+                # and the next-iter assert at draft() line ~583 crashes the
+                # scheduler.
+                batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
+                    device=batch.device,
+                    hidden_size=self._recurrent_hidden_size,
+                    dtype=self.model_config.dtype,
+                    topk=self.topk,
+                    capture_hidden_mode=CaptureHiddenMode.LAST,
+                )
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         return GenerationBatchResult(
@@ -580,7 +596,13 @@ class FrozenKVMTPWorker(TpModelWorker):
             req.decode_batch_idx += 1
 
         spec_info = batch.spec_info
-        assert isinstance(spec_info, FrozenKVMTPDraftInput)
+        assert isinstance(spec_info, FrozenKVMTPDraftInput), (
+            f"draft() expected FrozenKVMTPDraftInput, got "
+            f"{type(spec_info).__name__}. This happens when the prior verify "
+            "left batch.spec_info as a *VerifyInput / *DraftExtendInput "
+            "(e.g. zero-accept verify) without resetting it. See the "
+            "post-verify path in forward_batch_generation for the fix."
+        )
 
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(

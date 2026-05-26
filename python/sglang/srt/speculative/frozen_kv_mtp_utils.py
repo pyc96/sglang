@@ -32,6 +32,53 @@ if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 
 
+def _maybe_swap_swa_state(
+    draft_attn_backend: "AttentionBackend", new_pool
+):
+    """Synchronise a backend's SWA-aware attributes with a swapped pool.
+
+    Some attention backends (notably ``trtllm_mha``) cache
+    ``use_sliding_window_kv_pool`` / ``_swa_kv_pool`` at __init__ time
+    from ``model_runner.token_to_kv_pool``.  When the FROZEN_KV_MTP
+    contexts swap ``token_to_kv_pool`` to the target's SWA pool, those
+    cached attributes go stale: the backend then treats every layer as
+    full-attention even though it is now reading the target's hybrid SWA
+    pool.  For SWA-typed layers this leaks full-pool page indices into
+    the SWA k_cache page table and crashes the trtllm_mha sm_100a
+    paged-attention kernel with ``Warp Illegal Address``.
+
+    This helper resolves the SWA-aware attributes from ``new_pool``
+    (whether or not it is an SWAKVPool) and writes them back onto the
+    backend.  Returns a tuple of the saved (use_swa, swa_kv_pool,
+    sliding_window_size) so the caller can restore them.
+    """
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    saved = (
+        getattr(draft_attn_backend, "use_sliding_window_kv_pool", None),
+        getattr(draft_attn_backend, "_swa_kv_pool", None),
+        getattr(draft_attn_backend, "sliding_window_size", None),
+    )
+    is_swa = isinstance(new_pool, SWAKVPool)
+    if hasattr(draft_attn_backend, "use_sliding_window_kv_pool"):
+        draft_attn_backend.use_sliding_window_kv_pool = is_swa
+    if hasattr(draft_attn_backend, "_swa_kv_pool"):
+        draft_attn_backend._swa_kv_pool = new_pool if is_swa else None
+    # sliding_window_size is per-layer in the model; the trtllm_mha
+    # backend caches a module-level value.  Don't change it: the draft
+    # model's own sliding_window_size already matches the target's
+    # (Gemma4-Assistant inherits the same sliding window).
+    return saved
+
+
+def _restore_swa_state(draft_attn_backend: "AttentionBackend", saved):
+    use_swa, swa_kv_pool, sliding_window_size = saved
+    if hasattr(draft_attn_backend, "use_sliding_window_kv_pool"):
+        draft_attn_backend.use_sliding_window_kv_pool = use_swa
+    if hasattr(draft_attn_backend, "_swa_kv_pool"):
+        draft_attn_backend._swa_kv_pool = swa_kv_pool
+
+
 @contextmanager
 def frozen_kv_target_view(
     forward_batch: ForwardBatch,
@@ -56,11 +103,15 @@ def frozen_kv_target_view(
     forward_batch.spec_info = None
     saved_backend_pool = draft_attn_backend.token_to_kv_pool
     draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    saved_swa_state = _maybe_swap_swa_state(
+        draft_attn_backend, kv_context.target_token_to_kv_pool
+    )
     try:
         yield
     finally:
         forward_batch.spec_info = saved_spec_info
         draft_attn_backend.token_to_kv_pool = saved_backend_pool
+        _restore_swa_state(draft_attn_backend, saved_swa_state)
 
 
 @contextmanager
@@ -84,10 +135,14 @@ def target_kv_pool_view(
         )
     saved_backend_pool = draft_attn_backend.token_to_kv_pool
     draft_attn_backend.token_to_kv_pool = kv_context.target_token_to_kv_pool
+    saved_swa_state = _maybe_swap_swa_state(
+        draft_attn_backend, kv_context.target_token_to_kv_pool
+    )
     try:
         yield
     finally:
         draft_attn_backend.token_to_kv_pool = saved_backend_pool
+        _restore_swa_state(draft_attn_backend, saved_swa_state)
 
 
 def set_frozen_kv_positions(forward_batch: ForwardBatch, topk: int) -> None:
