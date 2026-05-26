@@ -252,10 +252,45 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # Overlap scheduling status for FROZEN_KV_MTP:
+    #
+    #   * Default (env unset): force disable_overlap_schedule=True. The
+    #     v1 FrozenKVMTPWorker doesn't support spec v2; the scheduler
+    #     would crash if it tried to run the v2 plumbing against the v1
+    #     worker output shape.
+    #
+    #   * SGLANG_FROZEN_KV_MTP_V2=1: scheduler keeps overlap enabled and
+    #     dispatches to FrozenKVMTPWorkerV2 (see
+    #     frozen_kv_mtp_worker_v2.py). That class is currently a
+    #     scaffolding stub that raises NotImplementedError at __init__
+    #     time with a pointer to the design plan
+    #     (runs/20260525_frozen_kv_mtp_v2_plan/PLAN.md). The opt-in env
+    #     and the dispatch are wired here so the follow-up PR that lands
+    #     the real implementation only has to fill in the worker body,
+    #     not also touch this argument handler.
+    import os
+
+    use_v2 = os.environ.get("SGLANG_FROZEN_KV_MTP_V2", "0") == "1"
+    if use_v2:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "FROZEN_KV_MTP V2 (overlap scheduling) does not yet support "
+                "--enable-dp-attention. Unset SGLANG_FROZEN_KV_MTP_V2 to use "
+                "the v1 path with dp attention."
+            )
+        logger.warning(
+            "SGLANG_FROZEN_KV_MTP_V2=1: dispatching to FrozenKVMTPWorkerV2. "
+            "Note that the v2 worker is currently a scaffolding stub; the "
+            "real implementation is tracked in "
+            "runs/20260525_frozen_kv_mtp_v2_plan/PLAN.md."
+        )
+    else:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for Frozen-KV MTP v1. Set "
+            "SGLANG_FROZEN_KV_MTP_V2=1 to opt into the (work-in-progress) "
+            "overlap-aware v2 worker."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False

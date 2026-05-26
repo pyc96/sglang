@@ -125,6 +125,13 @@ class SpeculativeAlgorithm(Enum):
         return FutureMap(device, self, req_to_token_pool)
 
     def supports_spec_v2(self) -> bool:
+        if self.is_frozen_kv_mtp():
+            # Opt-in: SGLANG_FROZEN_KV_MTP_V2=1 selects FrozenKVMTPWorkerV2.
+            # The v1 path stays the default until the v2 wrapper is fully
+            # validated; the env var is documented in PR #23.
+            import os
+
+            return os.environ.get("SGLANG_FROZEN_KV_MTP_V2", "0") == "1"
         return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
@@ -157,10 +164,15 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_frozen_kv_mtp():
             if enable_overlap:
-                raise ValueError(
-                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
-                    "scheduling to use FrozenKVMTPWorker."
+                # supports_spec_v2() returns True only when
+                # SGLANG_FROZEN_KV_MTP_V2=1; if we get here under
+                # enable_overlap=True, the env knob is set, so dispatch
+                # to the v2 wrapper.
+                from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+                    FrozenKVMTPWorkerV2,
                 )
+
+                return FrozenKVMTPWorkerV2
 
             from sglang.srt.speculative.frozen_kv_mtp_worker import (
                 FrozenKVMTPWorker,
