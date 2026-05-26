@@ -604,7 +604,17 @@ class FrozenKVMTPWorker(TpModelWorker):
             "post-verify path in forward_batch_generation for the fix."
         )
 
-        if batch.sampling_info.penalizer_orchestrator.is_required:
+        # Under spec-v2 overlap, `batch.sampling_info` is the forward-only
+        # copy whose `penalizer_orchestrator` is None (the orchestrator
+        # only lives on the scheduler-side SamplingBatchInfo to avoid
+        # double-accumulation across the overlap window). Skip the
+        # cumulate call in that case — the orchestrator on the scheduler
+        # side does the equivalent work.
+        if (
+            batch.sampling_info is not None
+            and batch.sampling_info.penalizer_orchestrator is not None
+            and batch.sampling_info.penalizer_orchestrator.is_required
+        ):
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
                 spec_info.bonus_tokens.to(torch.int64)
             )

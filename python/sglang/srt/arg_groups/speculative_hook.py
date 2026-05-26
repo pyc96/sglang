@@ -252,10 +252,29 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # SGLANG_FROZEN_KV_MTP_V2=1 selects FrozenKVMTPWorkerV2 (overlap
+    # scheduling). v1 has no overlap support; force-disable when env=0.
+    import os
+
+    use_v2 = os.environ.get("SGLANG_FROZEN_KV_MTP_V2", "0") == "1"
+    if use_v2:
+        if server_args.enable_dp_attention:
+            raise ValueError(
+                "FROZEN_KV_MTP V2 (overlap scheduling) does not yet support "
+                "--enable-dp-attention. Unset SGLANG_FROZEN_KV_MTP_V2 to use "
+                "the v1 path with dp attention."
+            )
+        logger.warning(
+            "SGLANG_FROZEN_KV_MTP_V2=1: dispatching to FrozenKVMTPWorkerV2 "
+            "(spec v2 / overlap scheduling). Unset the env var to fall "
+            "back to the v1 FrozenKVMTPWorker."
+        )
+    else:
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for Frozen-KV MTP v1. Set "
+            "SGLANG_FROZEN_KV_MTP_V2=1 to opt into the overlap-aware v2 worker."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
