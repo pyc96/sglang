@@ -237,10 +237,25 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # Default: V1 ``FrozenKVMTPWorker`` with overlap disabled (preserves
+    # existing behavior).  Experimental EAGLE-V2-based path is opt-in
+    # via ``SGLANG_GEMMA4_MTP_VIA_EAGLE=1``; that path is NOT yet
+    # functional (CUDA-graph buffer size mismatch).  See PR body for
+    # detailed analysis.
+    import os
+
+    if os.environ.get("SGLANG_GEMMA4_MTP_VIA_EAGLE", "0") != "1":
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for Frozen-KV MTP (V1 path; "
+            "set SGLANG_GEMMA4_MTP_VIA_EAGLE=1 to try the experimental "
+            "EAGLE-V2 path)."
+        )
+    else:
+        logger.warning(
+            "EXPERIMENTAL: routing Frozen-KV MTP through Gemma4MTPEagleWorker. "
+            "This path is not yet functional and will fail during init."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False
