@@ -36,6 +36,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
+import torch
+
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
@@ -187,9 +189,9 @@ class FrozenKVMTPWorkerV2(FrozenKVMTPWorker, BaseSpecWorker):
                 )
 
             # Ferry the seed-step output as next_draft_input for the
-            # spec-V2 future_map.stash.  If for any reason batch.spec_info
-            # is not a populated FrozenKVMTPDraftInput, synthesize an idle
-            # one so the stash doesn't crash on .topk_p access.
+            # spec-V2 future_map.stash.  Must size by batch.req_pool_indices
+            # (= future_indices used by scheduler) so the stash kernel
+            # doesn't shape-mismatch.
             next_draft_input_pf = batch.spec_info
             if not isinstance(next_draft_input_pf, FrozenKVMTPDraftInput):
                 next_draft_input_pf = FrozenKVMTPDraftInput.create_idle_input(
@@ -259,22 +261,115 @@ class FrozenKVMTPWorkerV2(FrozenKVMTPWorker, BaseSpecWorker):
         set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
 
         # Resolve next_draft_input for the spec-V2 future_map.stash.
-        # V1 sets batch.spec_info = draft_input (FrozenKVMTPDraftInput)
-        # inside the seed step when it runs.  When all reqs finish (no
-        # seed needed) it returns early and leaves batch.spec_info as
-        # the verify/draft-extend input; the scheduler.stash would then
-        # crash because it expects a populated DraftInput.  Synthesize
-        # an idle DraftInput in that case so the stash sees a valid
-        # (topk_p, topk_index, hidden_states) payload.
-        next_draft_input = batch.spec_info
-        if not isinstance(next_draft_input, FrozenKVMTPDraftInput):
-            next_draft_input = FrozenKVMTPDraftInput.create_idle_input(
+        # The future map indexes by ``batch.req_pool_indices`` (size B).
+        # All payload fields must be sized [B, ...] -- not [total_accepted]
+        # (which is the flat shape of ``verify_output.accept_tokens``).
+        spec_info_after_seed = batch.spec_info
+        bs = batch.req_pool_indices.shape[0]
+
+        if (
+            isinstance(spec_info_after_seed, FrozenKVMTPDraftInput)
+            and spec_info_after_seed.bonus_tokens is not None
+            and spec_info_after_seed.bonus_tokens.shape[0] == bs
+        ):
+            # Seed step ran for all reqs (no req finished mid-verify).
+            # batch.spec_info already has full-batch-sized fields.
+            next_draft_input = spec_info_after_seed
+        else:
+            # Either no seed ran (all reqs finished) or the seed
+            # populated only unfinished rows.  Build a full-B
+            # FrozenKVMTPDraftInput, copy seed values into the
+            # unfinished rows, zero-pad the rest.
+            unfinished_idx = None
+            if (
+                isinstance(spec_info_after_seed, FrozenKVMTPDraftInput)
+                and spec_info_after_seed.bonus_tokens is not None
+                and spec_info_after_seed.bonus_tokens.shape[0] > 0
+                and draft_extend_input.req_pool_indices is not None
+            ):
+                # Recover the indices of the unfinished reqs by matching
+                # ``draft_extend_input.req_pool_indices`` (the subset that
+                # ran the seed) to ``batch.req_pool_indices`` (the full
+                # batch).  This is the same mapping the verify path uses
+                # to slice ``unfinished_index_device``.
+                full_idx = batch.req_pool_indices
+                unfinished_pool = draft_extend_input.req_pool_indices
+                unfinished_idx = torch.where(
+                    (full_idx.unsqueeze(1) == unfinished_pool.unsqueeze(0)).any(dim=1)
+                )[0]
+
+            hidden_size = self._recurrent_hidden_size
+            dtype = self.model_config.dtype
+            topk = self.topk
+
+            # Build [B] bonus_tokens by picking the LAST accepted token
+            # per req from the flat ``verify_output.accept_tokens`` (which
+            # is sized [total_accepted_across_all_reqs]).  The number
+            # accepted per req is in ``num_correct_drafts_per_req_cpu``
+            # plus 1 for the always-accepted bonus.
+            num_accept_per_req = torch.tensor(
+                [n + 1 for n in verify_output.num_correct_drafts_per_req_cpu],
                 device=self.device,
-                hidden_size=self._recurrent_hidden_size,
-                dtype=self.model_config.dtype,
-                topk=self.topk,
-                capture_hidden_mode=CaptureHiddenMode.LAST,
+                dtype=torch.long,
             )
+            per_req_last_idx = torch.cumsum(num_accept_per_req, dim=0) - 1
+            full_bonus = verify_output.accept_tokens[per_req_last_idx].to(torch.int32)
+            full_topk_p = torch.zeros(
+                (bs, topk), device=self.device, dtype=torch.float32
+            )
+            full_topk_index = torch.zeros(
+                (bs, topk), device=self.device, dtype=torch.int64
+            )
+            full_hidden = (
+                torch.zeros((bs, hidden_size), device=self.device, dtype=dtype)
+                if hidden_size is not None
+                else None
+            )
+
+            if (
+                unfinished_idx is not None
+                and unfinished_idx.shape[0] > 0
+                and isinstance(spec_info_after_seed, FrozenKVMTPDraftInput)
+            ):
+                if (
+                    spec_info_after_seed.topk_p is not None
+                    and spec_info_after_seed.topk_p.shape[0] == unfinished_idx.shape[0]
+                ):
+                    full_topk_p[unfinished_idx] = spec_info_after_seed.topk_p
+                if (
+                    spec_info_after_seed.topk_index is not None
+                    and spec_info_after_seed.topk_index.shape[0]
+                    == unfinished_idx.shape[0]
+                ):
+                    full_topk_index[unfinished_idx] = spec_info_after_seed.topk_index
+                if (
+                    full_hidden is not None
+                    and spec_info_after_seed.hidden_states is not None
+                    and spec_info_after_seed.hidden_states.shape[0]
+                    == unfinished_idx.shape[0]
+                ):
+                    full_hidden[unfinished_idx] = spec_info_after_seed.hidden_states.to(
+                        dtype
+                    )
+
+            next_draft_input = FrozenKVMTPDraftInput(
+                bonus_tokens=full_bonus,
+                hidden_states=full_hidden,
+                topk_p=full_topk_p,
+                topk_index=full_topk_index,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+                new_seq_lens=batch.seq_lens.to(torch.int32),
+            )
+
+        # accept_lens is required by the spec-V2 batch result processor's
+        # _resolve_spec_overlap_tokens path.  It is per-req: total accepted
+        # tokens including the bonus.  V1 returns num_correct_drafts_per_req
+        # (without bonus); add 1 for the bonus.
+        accept_lens_cpu = torch.tensor(
+            [n + 1 for n in verify_output.num_correct_drafts_per_req_cpu],
+            dtype=torch.int32,
+            device="cpu",
+        )
 
         return GenerationBatchResult(
             logits_output=verify_output.logits_output,
@@ -283,4 +378,6 @@ class FrozenKVMTPWorkerV2(FrozenKVMTPWorker, BaseSpecWorker):
             num_correct_drafts_per_req_cpu=verify_output.num_correct_drafts_per_req_cpu,
             can_run_cuda_graph=False,
             next_draft_input=next_draft_input,
+            accept_lens=accept_lens_cpu,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
         )
