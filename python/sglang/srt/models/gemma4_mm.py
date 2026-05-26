@@ -258,6 +258,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.logits_processor = LogitsProcessor(config.text_config)
         self.capture_aux_hidden_states = False
 
+        # Lazy-initialized dynamic batch sizing for the vision encoder; see
+        # `_encoder_max_batch`. Ported from vllm-project/vllm#43169.
+        # `_encoder_bytes_per_patch` is populated at the end of `load_weights`
+        # so that it sees the vision_config that was actually loaded.
+        self._encoder_budget_bytes = 0
+        self._encoder_bytes_per_patch = 0
+
         self.post_init()
 
     @property
@@ -395,124 +402,223 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             )
             get_attn_backend().forward_metadata.custom_mask = bidirectional_attn_masks
 
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        vt = self.vision_tower
+    # ------------------------------------------------------------------ #
+    # Multimodal feature extraction
+    #
+    # Both `get_image_feature` and `get_video_feature` historically iterated
+    # one image (or one video frame) at a time through `self.vision_tower(...)`,
+    # then once more through `self.embed_vision(...)`. The vision tower
+    # already supports a batched first dim (`Gemma4VisionEncoder.forward`
+    # takes [B, num_patches, patch_pixels]) and the embedder is purely
+    # pointwise (RMSNorm + Linear), so both loops are unnecessary
+    # serialization that limits throughput for concurrent requests carrying
+    # multiple images.
+    #
+    # Pattern ported from vllm-project/vllm#43169:
+    #   - Group items by patch count (resolution bucket) so each encoder
+    #     call processes a uniform-shape batch with no cross-resolution
+    #     padding.
+    #   - Optionally chunk a bucket so an encoder forward doesn't blow the
+    #     activation budget (see `_encoder_max_batch`); on a B200/H100 with
+    #     small E2B/E4B encoders the chunking is usually a no-op.
+    #   - Concatenate all per-item valid tokens and run `embed_vision`
+    #     exactly once.
+    # ------------------------------------------------------------------ #
 
-        all_embeds = []
+    def _encoder_max_batch(self, patches_per_item: int) -> int:
+        """Max items per encoder call given per-item patch count.
+
+        The first call lazily computes a per-process memory budget equal to
+        5% of total device memory; subsequent calls reuse it.
+        `_encoder_bytes_per_patch` is populated by `load_weights` from the
+        loaded `vision_config`. If neither is available yet (e.g. before
+        weight load on the first prefill step in tests) we degrade
+        gracefully to a single-item batch.
+        """
+        if self._encoder_bytes_per_patch == 0:
+            return 1
+        if self._encoder_budget_bytes == 0:
+            try:
+                total_mem = torch.cuda.get_device_properties(
+                    self.vision_tower.device
+                ).total_memory
+            except Exception:
+                total_mem = 0
+            self._encoder_budget_bytes = int(total_mem * 0.05)
+        cost = patches_per_item * self._encoder_bytes_per_patch
+        if cost <= 0:
+            return 1
+        return max(1, self._encoder_budget_bytes // cost)
+
+    def _flatten_pixel_lists(
+        self,
+        items: List[MultimodalDataItem],
+        position_ids_attr: str,
+        modality_label: str,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+        """Walk `items`, returning three parallel lists:
+        - `prepass_embeds`: per-item embeddings the caller passed in directly
+          (already in text-embedding space — bypass the vision tower).
+        - `pixel_values_list`: per-encoder-item pre-patchified pixel tensors,
+          shaped (num_patches, patch_pixels). Video items contribute one entry
+          per frame.
+        - `position_ids_list`: matching (num_patches, 2) tensors with -1 in
+          padding rows.
+        """
+        prepass_embeds: List[torch.Tensor] = []
+        pixel_values_list: List[torch.Tensor] = []
+        position_ids_list: List[torch.Tensor] = []
+
         for item in items:
             all_pixel_values = flatten_nested_list([item.feature])
             all_position_ids = flatten_nested_list(
-                [getattr(item, "image_position_ids", None)]
+                [getattr(item, position_ids_attr, None)]
             )
 
             for pv_idx, pv in enumerate(all_pixel_values):
+                # Caller pre-computed the embedding; nothing to encode.
                 if (
                     pv.dim() in (2, 3)
                     and pv.shape[-1] == self.config.text_config.hidden_size
                 ):
-                    all_embeds.append(pv.to(self.language_model.device))
+                    prepass_embeds.append(pv.to(self.language_model.device))
                     continue
 
                 if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
                     raise ValueError(
-                        f"pixel_values[{pv_idx}] has no matching image_position_ids. "
-                        "The HF image processor likely renamed this output — "
-                        "update ATTR_NAME_TO_MODALITY in the Gemma4 processor."
+                        f"{modality_label}[{pv_idx}] has no matching "
+                        f"{position_ids_attr}. The HF processor likely "
+                        "renamed this output — update ATTR_NAME_TO_MODALITY "
+                        "in the Gemma4 processor."
                     )
                 pp = all_position_ids[pv_idx]
 
-                # Vision tower expects 3-D (batch, num_patches, ...).
-                # A single image may arrive as 2-D; add the batch dim if needed.
+                # Normalize to 3-D batched shape: (num_items, num_patches, ...).
+                # Video tensors arrive as (num_videos, num_frames, num_patches,
+                # ...); flatten num_videos × num_frames into the first dim.
                 if pv.dim() == 2:
                     pv = pv.unsqueeze(0)
                 if pp.dim() == 2:
                     pp = pp.unsqueeze(0)
-
-                pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
-                pp = pp.to(device=vt.device)
-
-                pooled, pooler_mask = vt(pv, pp)
-
-                for hs, mask in zip(pooled, pooler_mask):
-                    real_tokens = hs[mask]
-                    all_embeds.append(
-                        self.embed_vision(
-                            inputs_embeds=real_tokens.unsqueeze(0)
-                        ).squeeze(0)
-                    )
-
-        if all_embeds:
-            return torch.cat(all_embeds, dim=0)
-        else:
-            return torch.empty(
-                0,
-                self.language_model.config.hidden_size,
-                device=next(self.parameters()).device,
-                dtype=self.language_model.dtype(),
-            )
-
-    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        """Encode video frames through the vision tower with video-specific pooling.
-
-        Each video is (num_frames, num_patches, patch_pixels) with matching
-        position_ids (num_frames, num_patches, 2).  Frames are flattened into
-        the batch dimension so each frame is encoded independently, then pooled
-        dynamically based on the input patch count and pooling_kernel_size.
-        """
-        vt = self.vision_tower
-
-        all_embeds = []
-        for item in items:
-            all_pixel_values = flatten_nested_list([item.feature])
-            all_position_ids = flatten_nested_list(
-                [getattr(item, "video_position_ids", None)]
-            )
-
-            for pv_idx, pv in enumerate(all_pixel_values):
-                if (
-                    pv.dim() in (2, 3)
-                    and pv.shape[-1] == self.config.text_config.hidden_size
-                ):
-                    all_embeds.append(pv.to(self.language_model.device))
-                    continue
-
-                if pv_idx >= len(all_position_ids) or all_position_ids[pv_idx] is None:
-                    raise ValueError(
-                        f"pixel_values_videos[{pv_idx}] has no matching video_position_ids."
-                    )
-                pp = all_position_ids[pv_idx]
-
-                # HF processor returns 4-D tensors
-                # (num_videos, num_frames, num_patches, ...) — collapse to
-                # 3-D (num_frames, num_patches, ...) so each frame is a
-                # batch element for the vision tower.
                 if pv.dim() == 4:
                     pv = pv.reshape(-1, pv.shape[-2], pv.shape[-1])
                 if pp.dim() == 4:
                     pp = pp.reshape(-1, pp.shape[-2], pp.shape[-1])
 
-                pv = pv.to(device=vt.device, dtype=self.language_model.dtype())
-                pp = pp.to(device=vt.device)
+                # Split the leading dim into per-encoder-item tensors so we can
+                # bucket by patch count in the caller. .unbind() returns views,
+                # so there's no extra copy here.
+                for sub_pv, sub_pp in zip(pv.unbind(0), pp.unbind(0)):
+                    pixel_values_list.append(sub_pv)
+                    position_ids_list.append(sub_pp)
 
-                pooled, pooler_mask = vt(pv, pp)
+        return prepass_embeds, pixel_values_list, position_ids_list
 
-                for hs, mask in zip(pooled, pooler_mask):
-                    real_tokens = hs[mask]
-                    all_embeds.append(
-                        self.embed_vision(
-                            inputs_embeds=real_tokens.unsqueeze(0)
-                        ).squeeze(0)
-                    )
+    def _batched_encode(
+        self,
+        pixel_values_list: List[torch.Tensor],
+        position_ids_list: List[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """Run the vision tower on `pixel_values_list` in resolution buckets,
+        run `embed_vision` exactly once over all valid tokens, and return the
+        per-item embeddings in the original input order.
+        """
+        if not pixel_values_list:
+            return []
+
+        vt = self.vision_tower
+        target_device = vt.device
+        target_dtype = self.language_model.dtype()
+
+        # 1) Bucket by patch count. All items inside a bucket share an encoder
+        # forward without any cross-resolution padding waste.
+        buckets: dict = {}
+        for idx, pv in enumerate(pixel_values_list):
+            buckets.setdefault(pv.shape[0], []).append(idx)
+
+        per_item_valid_tokens: List[Optional[torch.Tensor]] = [None] * len(
+            pixel_values_list
+        )
+
+        for patches, member_indices in buckets.items():
+            max_batch = min(len(member_indices), self._encoder_max_batch(patches))
+
+            for chunk_start in range(0, len(member_indices), max_batch):
+                chunk_indices = member_indices[chunk_start : chunk_start + max_batch]
+
+                # Stack into one [chunk, num_patches, ...] tensor per call.
+                pv_batch = torch.stack(
+                    [pixel_values_list[i] for i in chunk_indices], dim=0
+                ).to(device=target_device, dtype=target_dtype)
+                pp_batch = torch.stack(
+                    [position_ids_list[i] for i in chunk_indices], dim=0
+                ).to(device=target_device)
+
+                # vt() returns (pooled[B, T, H], pooler_mask[B, T]). The mask
+                # marks valid (non-padding) tokens; widths differ across
+                # batch elements, so we strip padding per item.
+                pooled, pooler_mask = vt(pv_batch, pp_batch)
+
+                for chunk_pos, orig_idx in enumerate(chunk_indices):
+                    per_item_valid_tokens[orig_idx] = pooled[chunk_pos][
+                        pooler_mask[chunk_pos]
+                    ]
+
+        # 2) Project all valid tokens in a single embedder call. The embedder
+        # is RMSNorm + Linear, both pointwise along the token axis, so the
+        # output is identical to running it per-item.
+        valid_lens = [t.shape[0] for t in per_item_valid_tokens]
+        flat_tokens = torch.cat(per_item_valid_tokens, dim=0)
+        flat_projected = self.embed_vision(
+            inputs_embeds=flat_tokens.unsqueeze(0)
+        ).squeeze(0)
+
+        # 3) Split back into per-item tensors (slicing returns views).
+        per_item_embeds: List[torch.Tensor] = []
+        offset = 0
+        for length in valid_lens:
+            per_item_embeds.append(flat_projected[offset : offset + length])
+            offset += length
+        return per_item_embeds
+
+    def _gather_mm_features(
+        self,
+        items: List[MultimodalDataItem],
+        position_ids_attr: str,
+        modality_label: str,
+    ) -> torch.Tensor:
+        """Common driver shared by image and video paths."""
+        prepass_embeds, pv_list, pp_list = self._flatten_pixel_lists(
+            items, position_ids_attr, modality_label
+        )
+        encoded_embeds = self._batched_encode(pv_list, pp_list)
+        # Concatenate prepass-passed-through embeddings first to preserve the
+        # original output order (prepass items are appended in walk order in
+        # `_flatten_pixel_lists`).
+        all_embeds = prepass_embeds + encoded_embeds
 
         if all_embeds:
             return torch.cat(all_embeds, dim=0)
-        else:
-            return torch.empty(
-                0,
-                self.language_model.config.hidden_size,
-                device=next(self.parameters()).device,
-                dtype=self.language_model.dtype(),
-            )
+        return torch.empty(
+            0,
+            self.language_model.config.hidden_size,
+            device=next(self.parameters()).device,
+            dtype=self.language_model.dtype(),
+        )
+
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        return self._gather_mm_features(items, "image_position_ids", "pixel_values")
+
+    def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        """Encode video frames through the vision tower.
+
+        Gemma4 has no separate video tower; frames are images at lower
+        resolution. All frames across all videos in the batch share one
+        bucketed encoder pass and one batched projection call.
+        """
+        return self._gather_mm_features(
+            items, "video_position_ids", "pixel_values_videos"
+        )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         if self.audio_tower is None:
@@ -1018,6 +1124,18 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 names = sorted(p for p in unloaded_params if pred(p))
                 if names:
                     logger.log(level, "%s: %s", msg, names)
+
+        # Cache the per-patch activation cost for `_encoder_max_batch`. We do
+        # this after the load instead of in __init__ so it reflects the
+        # vision_config that was actually loaded (some checkpoints override
+        # the config). Mirrors vllm-project/vllm#43169.
+        vis_cfg = getattr(self.config, "vision_config", None)
+        if vis_cfg is not None and self.pp_group.is_first_rank:
+            hidden = int(getattr(vis_cfg, "hidden_size", 0))
+            num_layers = int(getattr(vis_cfg, "num_hidden_layers", 0))
+            # 2 bytes/element (bf16/fp16) × residual stream per patch × layers.
+            self._encoder_bytes_per_patch = hidden * 2 * num_layers
+
         return loaded_params
 
     lora_pattern = re.compile(
