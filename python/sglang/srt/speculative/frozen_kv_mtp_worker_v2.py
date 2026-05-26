@@ -302,6 +302,23 @@ class FrozenKVMTPWorkerV2(BaseSpecWorker):
         predict, accept_lens, accept_index = verify_input.sample(
             batch, logits_output, vocab_mask
         )
+
+        # EOS truncation. v1's EagleVerifyInput.verify per-req loop walks
+        # accept_index_row and, on the first token that matches an EOS /
+        # stop-token / max-new-tokens cap, sets all subsequent positions
+        # of accept_index[i, :] to -1 and shrinks the per-req accept count
+        # accordingly. v2's sample() does NOT do this — without the
+        # truncation, finished requests commit post-EOS tokens, and the
+        # MM color test drops from 30/30 to 28-29/30.
+        #
+        # We do the same scan here purely-functionally (no req state
+        # mutation): the scheduler's `process_batch_result_decode` still
+        # owns `update_finish_state`, `output_ids.extend`, grammar
+        # tracking, etc. — it just sees the right (truncated)
+        # `accept_lens[i]` slice.
+        if not batch.forward_mode.is_idle():
+            self._truncate_at_eos_inplace(batch, predict, accept_lens, accept_index)
+
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Publish fence — after verify, before seed.
@@ -462,6 +479,107 @@ class FrozenKVMTPWorkerV2(BaseSpecWorker):
             (bs, recurrent_hidden), device=self.device, dtype=target_dtype
         )
 
+    def _truncate_at_eos_inplace(
+        self,
+        batch: ScheduleBatch,
+        predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        accept_index: torch.Tensor,
+    ) -> None:
+        """Mirror v1 ``EagleVerifyInput.verify``'s per-req EOS truncation
+        in pure-functional form. Mutates ``accept_lens`` and
+        ``accept_index`` in place so:
+
+          * ``accept_index[i, j+1:] = -1`` past the first EOS-matching
+            (or max-new-tokens-overflowing) accepted token,
+          * ``accept_lens[i]`` = truncated count incl. the EOS token
+            itself,
+
+        without touching any ``req`` state (``output_ids``,
+        ``finished_reason``, ``grammar``, ``reasoning_tokens``, ...).
+        The scheduler's ``process_batch_result_decode`` performs those
+        mutations once it sees the corrected per-req slice.
+
+        Why purely functional:
+          v1 mutates ``req`` state inside the verify loop because the v1
+          batch_result_processor doesn't repeat that work. v2's
+          batch_result_processor DOES repeat it (lines 607-623 of
+          batch_result_processor.py). Calling ``update_finish_state`` etc.
+          twice causes:
+            * grammar.accept_token() double-accepts (corrupts grammar).
+            * Reasoning token counter doubled.
+            * Two FINISH_MATCHED_TOKEN with different ``finished_len``.
+
+        Grammar limitation (documented):
+          v1's loop checks grammar termination after each accepted token
+          and stops the spec if the grammar terminates mid-accept. v2's
+          purely-functional truncation does NOT do this — grammar
+          termination is detected downstream by the scheduler after the
+          full ``accept_lens[i]`` slice has been ``output_ids.extend``-ed.
+          For grammar-using requests this can cause one extra committed
+          token past the grammar terminator. Acceptable for now (the MM
+          color test uses no grammar). Tracked as a follow-up.
+        """
+        # Per-req CPU walk. ``predict`` and ``accept_index`` live on the
+        # device; we copy small per-row slices on demand. The cost is one
+        # GPU->CPU sync (the ``.tolist()``) per call, which is what v1
+        # already pays.
+        bs = len(batch.reqs)
+        if bs == 0:
+            return
+
+        accept_index_cpu = accept_index.tolist()  # [[ints]] of shape [bs, spec_steps+1]
+        predict_cpu = predict.tolist()
+        new_accept_lens_cpu = accept_lens.tolist()
+        mutated_index = False
+
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            if req.sampling_params.ignore_eos:
+                continue
+            # Walk row, count tokens up to (and including) the first EOS.
+            new_count = 0
+            for j, idx in enumerate(accept_index_row):
+                if idx == -1:
+                    break
+                new_count += 1
+                tok_id = predict_cpu[idx]
+                # max_new_tokens cap: if appending this token would push
+                # ``len(output_ids)`` past the cap, the cap-finish fires
+                # AT this token. Mirror v1's `update_finish_state` cap
+                # check.
+                cur_out_len = len(req.output_ids) + new_count
+                cap = req.sampling_params.max_new_tokens
+                if cap is not None and cur_out_len >= cap:
+                    accept_index_row[j + 1 :] = [-1] * (len(accept_index_row) - j - 1)
+                    mutated_index = True
+                    break
+                # EOS / stop-token check (pure; no req mutation).
+                if _is_finish_token(req, tok_id):
+                    accept_index_row[j + 1 :] = [-1] * (len(accept_index_row) - j - 1)
+                    mutated_index = True
+                    break
+            new_accept_lens_cpu[i] = new_count
+
+        # Push corrected accept_lens back to GPU (small per-bs copy).
+        # Avoid the round trip when nothing changed.
+        if mutated_index or new_accept_lens_cpu != accept_lens.tolist():
+            # Build new accept_index from the mutated CPU rows.
+            new_accept_index_cpu = accept_index_cpu  # mutated in place above
+            accept_index.copy_(
+                torch.tensor(
+                    new_accept_index_cpu,
+                    dtype=accept_index.dtype,
+                    device=accept_index.device,
+                )
+            )
+            accept_lens.copy_(
+                torch.tensor(
+                    new_accept_lens_cpu,
+                    dtype=accept_lens.dtype,
+                    device=accept_lens.device,
+                )
+            )
+
     def _coerce_draft_input(self, spec_info) -> Optional[EagleDraftInput]:
         if spec_info is None:
             return None
@@ -472,3 +590,27 @@ class FrozenKVMTPWorkerV2(BaseSpecWorker):
             type(spec_info).__name__,
         )
         return None
+
+
+def _is_finish_token(req, token_id: int) -> bool:
+    """Pure-functional EOS / stop-token check. Mirrors the predicate
+    inside ``Req._check_token_based_finish`` (schedule_batch.py:1167)
+    WITHOUT mutating ``req.finished_reason`` / ``finished_len`` — the
+    scheduler's ``process_batch_result_decode`` does that downstream
+    after the corrected accept_lens slice reaches ``update_finish_state``.
+    """
+    if (
+        req.sampling_params.stop_token_ids
+        and token_id in req.sampling_params.stop_token_ids
+    ):
+        return True
+    if req.eos_token_ids and token_id in req.eos_token_ids:
+        return True
+    tok = getattr(req, "tokenizer", None)
+    if tok is not None:
+        if token_id == tok.eos_token_id:
+            return True
+        extra = getattr(tok, "additional_stop_token_ids", None)
+        if extra and token_id in extra:
+            return True
+    return False
