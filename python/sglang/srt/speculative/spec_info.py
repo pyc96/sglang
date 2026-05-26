@@ -125,7 +125,11 @@ class SpeculativeAlgorithm(Enum):
         return FutureMap(device, self, req_to_token_pool)
 
     def supports_spec_v2(self) -> bool:
-        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+        # FROZEN_KV_MTP now routes through Gemma4MTPEagleWorker (subclass
+        # of EAGLEWorkerV2) when overlap scheduling is enabled, so it
+        # qualifies for spec v2.  V1 fallback still available via
+        # ``--disable-overlap-schedule``.
+        return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -140,9 +144,9 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         enable_overlap = not server_args.disable_overlap_schedule
 
@@ -156,10 +160,39 @@ class SpeculativeAlgorithm(Enum):
             return DFlashWorker
 
         if self.is_frozen_kv_mtp():
+            # Experimental: route to the Gemma-4 MTP EAGLE V2 worker
+            # (which inherits the standard EAGLE V2 overlap pipeline +
+            # adds frozen-KV binding at init time).  Mirrors the
+            # architectural pattern vLLM uses for Gemma-4 MTP in
+            # ``vllm/v1/spec_decode/gemma4.py``.
+            #
+            # Gated behind ``SGLANG_GEMMA4_MTP_VIA_EAGLE=1`` because the
+            # path is NOT YET FUNCTIONAL: it hits CUDA-graph-buffer-size
+            # mismatch (draft.spec_hidden_size=1024 vs target.backbone
+            # _hidden_size=5376) during cuda graph capture.  See PR body
+            # for the full debugging trace + remaining work.
+            #
+            # Default behavior preserved: V1 ``FrozenKVMTPWorker`` with
+            # ``disable_overlap_schedule=True`` until the EAGLE-based path
+            # is completed.
+            import os
+
+            if (
+                enable_overlap
+                and os.environ.get("SGLANG_GEMMA4_MTP_VIA_EAGLE", "0") == "1"
+            ):
+                from sglang.srt.speculative.gemma4_mtp_via_eagle import (
+                    Gemma4MTPEagleWorker,
+                )
+
+                return Gemma4MTPEagleWorker
+
             if enable_overlap:
                 raise ValueError(
-                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
-                    "scheduling to use FrozenKVMTPWorker."
+                    "FROZEN_KV_MTP does not yet support spec v2 by default. "
+                    "Disable overlap scheduling to use FrozenKVMTPWorker, "
+                    "or set SGLANG_GEMMA4_MTP_VIA_EAGLE=1 to opt into the "
+                    "experimental EAGLE-V2-based path."
                 )
 
             from sglang.srt.speculative.frozen_kv_mtp_worker import (
