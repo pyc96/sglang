@@ -125,7 +125,11 @@ class SpeculativeAlgorithm(Enum):
         return FutureMap(device, self, req_to_token_pool)
 
     def supports_spec_v2(self) -> bool:
-        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
+        # FROZEN_KV_MTP now has a minimum-viable spec-V2 worker
+        # (``FrozenKVMTPWorkerV2``) that inherits the V1 logic and adds
+        # the BaseSpecWorker interface + on_publish fence point.  Users
+        # can opt out via ``--disable-overlap-schedule`` to force V1.
+        return self.is_eagle() or self.is_standalone()
 
     def get_num_tokens_per_bs_for_target_verify(
         self, num_draft_tokens: int, is_draft_worker: bool
@@ -140,9 +144,9 @@ class SpeculativeAlgorithm(Enum):
     def create_worker(
         self, server_args: ServerArgs
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
-        assert (
-            not self.is_none()
-        ), "Cannot create worker for NONE speculative algorithm."
+        assert not self.is_none(), (
+            "Cannot create worker for NONE speculative algorithm."
+        )
 
         enable_overlap = not server_args.disable_overlap_schedule
 
@@ -157,10 +161,17 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_frozen_kv_mtp():
             if enable_overlap:
-                raise ValueError(
-                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
-                    "scheduling to use FrozenKVMTPWorker."
+                # Spec V2 (overlap scheduling) path for FROZEN_KV_MTP.
+                # The V2 worker inherits the correctness-tested V1 logic
+                # and adds the BaseSpecWorker interface + verify-end
+                # on_publish fence so the scheduler's future map can
+                # publish new ``seq_lens`` while the GPU is still busy
+                # with the seed step.
+                from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+                    FrozenKVMTPWorkerV2,
                 )
+
+                return FrozenKVMTPWorkerV2
 
             from sglang.srt.speculative.frozen_kv_mtp_worker import (
                 FrozenKVMTPWorker,

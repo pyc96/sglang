@@ -237,10 +237,30 @@ def _handle_frozen_kv_mtp(server_args: "ServerArgs") -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    server_args.disable_overlap_schedule = True
-    logger.warning(
-        "Overlap scheduler is disabled when using Frozen-KV MTP speculative decoding (spec v2 is not supported yet)."
-    )
+    # Spec V2 (overlap scheduling) for FROZEN_KV_MTP is experimental.
+    # The V2 worker (``FrozenKVMTPWorkerV2``) is wired through the
+    # dispatcher but the per-iteration ``next_draft_input`` ferry hits
+    # several scheduler-side assumptions about populated draft inputs
+    # that require additional plumbing (idle-batch DraftInput shape,
+    # empty-bonus-tokens stash) before the path is production-ready.
+    # Force V1 by default and require an explicit env var
+    # (``SGLANG_FROZEN_KV_MTP_EXPERIMENTAL_V2=1``) to opt into V2.
+    import os
+
+    if os.environ.get("SGLANG_FROZEN_KV_MTP_EXPERIMENTAL_V2", "0") != "1":
+        server_args.disable_overlap_schedule = True
+        logger.warning(
+            "Overlap scheduler is disabled for Frozen-KV MTP (spec V2 is "
+            "experimental; set SGLANG_FROZEN_KV_MTP_EXPERIMENTAL_V2=1 to "
+            "opt into FrozenKVMTPWorkerV2)."
+        )
+    else:
+        logger.warning(
+            "EXPERIMENTAL: Frozen-KV MTP V2 (overlap scheduling) is enabled "
+            "via SGLANG_FROZEN_KV_MTP_EXPERIMENTAL_V2=1. The path is not "
+            "production-ready: the per-iteration draft-input ferry has "
+            "known gaps with empty/idle batches and may crash."
+        )
 
     if server_args.enable_mixed_chunk:
         server_args.enable_mixed_chunk = False

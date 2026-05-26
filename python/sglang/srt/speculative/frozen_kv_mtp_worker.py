@@ -136,8 +136,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -398,8 +400,9 @@ class FrozenKVMTPWorker(TpModelWorker):
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
             self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
@@ -582,10 +585,18 @@ class FrozenKVMTPWorker(TpModelWorker):
         spec_info = batch.spec_info
         assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
-        if batch.sampling_info.penalizer_orchestrator.is_required:
-            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
-                spec_info.bonus_tokens.to(torch.int64)
-            )
+        # Under spec-V2 / overlap scheduling, sampling (and therefore the
+        # penalizer cumulate) lives on the schedule stream via
+        # ``EagleDraftInputV2Mixin.prepare_for_decode``.  The worker side
+        # must skip the cumulate when the orchestrator is absent.
+        _sampling_info = batch.sampling_info
+        _penalizer = (
+            _sampling_info.penalizer_orchestrator
+            if _sampling_info is not None
+            else None
+        )
+        if _penalizer is not None and _penalizer.is_required:
+            _penalizer.cumulate_output_tokens(spec_info.bonus_tokens.to(torch.int64))
 
         spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         spec_info.num_tokens_per_req = self.topk
@@ -682,8 +693,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
