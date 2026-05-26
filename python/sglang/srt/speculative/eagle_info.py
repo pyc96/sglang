@@ -296,14 +296,18 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )
 
         # Apply penalty
+        # None-safe for spec-V2/overlap where penalizer is None (sampling
+        # and the penalty cumulate live on the schedule stream).
+        _penalizer_v2 = sampling_info.penalizer_orchestrator
         if (
-            sampling_info.penalizer_orchestrator.is_required
-            or sampling_info.logit_bias is not None
-        ):
+            _penalizer_v2 is not None and _penalizer_v2.is_required
+        ) or sampling_info.logit_bias is not None:
             # This is a relaxed version of penalties for speculative decoding.
-            sampling_info.penalizer_orchestrator.apply(
-                logits_output.next_token_logits, repeat=self.draft_token_num
-            )
+            if _penalizer_v2 is not None and _penalizer_v2.is_required:
+                _penalizer_v2.apply(
+                    logits_output.next_token_logits,
+                    repeat=self.draft_token_num,
+                )
             if sampling_info.logit_bias is not None:
                 logits_output.next_token_logits.add_(
                     torch.repeat_interleave(
@@ -443,9 +447,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     try:
                         req.grammar.accept_token(id)
                     except ValueError as e:
-                        logger.info(
-                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
-                        )
+                        logger.info(f"{i=}, {req=}\n{accept_index=}\n{predict=}\n")
                         raise e
                     req.update_finish_state()
                 if req.finished():
