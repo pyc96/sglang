@@ -51,8 +51,54 @@ class FrozenKVMTPInputBuffers(ForwardInputBuffers):
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
 
 
+@dataclass
+class FrozenKVMTPSeedInputBuffers(ForwardInputBuffers):
+    """Static input/output buffers for the assistant *seed* step.
+
+    The seed step is a single decode-shape forward of the assistant
+    model (one token per request).  Inputs differ from the recurrent
+    loop's: there are no ``topk_p`` / ``topk_index`` (these are
+    OUTPUTS of the seed); instead we feed ``input_ids`` (the bonus
+    token from prefill or verify) and ``hidden_states`` (the last
+    target hidden state, sized at the assistant's recurrent
+    ``hidden_size``).
+    """
+
+    req_pool_indices: torch.Tensor
+    positions: torch.Tensor
+    mrope_positions: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    input_ids: torch.Tensor
+    hidden_states: torch.Tensor
+    # Outputs that the captured graph writes into; the worker reads
+    # them after replay and stitches them onto the new
+    # FrozenKVMTPDraftInput for the next iter.
+    out_topk_p: torch.Tensor
+    out_topk_index: torch.Tensor
+    out_hidden_states: torch.Tensor
+    global_num_tokens_gpu: Optional[torch.Tensor]
+    global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
+
+
 class FrozenKVMTPCudaGraphRunner:
-    """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step."""
+    """CUDA graph runner for the Frozen-KV MTP recurrent draft-loop step
+    and the assistant seed step.
+
+    The recurrent loop runs ``speculative_num_steps - 1`` forwards of
+    the draft model and produces a tree of candidate tokens.  Captured
+    via ``_capture_loop_graph`` + ``replay`` (legacy, unchanged).
+
+    The seed step runs ONE forward of the draft model and seeds the
+    next iter's ``FrozenKVMTPDraftInput`` with ``topk_p`` / ``topk_index``
+    / ``hidden_states``.  It runs after the target's prefill and after
+    every verify -- twice per scheduler iter in steady state.  Captured
+    via ``_capture_seed_graph`` + ``replay_seed`` (new in this PR).
+
+    Before this PR the seed step ran EAGER, costing ~1 forward worth of
+    GPU latency per scheduler iter (~20-25 % of decode wall time at
+    ``speculative_num_steps=3``).
+    """
 
     def __init__(self, frozen_kv_mtp_worker: FrozenKVMTPWorker):
         self.frozen_kv_mtp_worker = frozen_kv_mtp_worker
@@ -148,6 +194,344 @@ class FrozenKVMTPCudaGraphRunner:
                 f"Capture frozen-KV MTP cuda graph failed: {e}\n"
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+        # ---- Seed-step graphs ---------------------------------------
+        # The seed step has different inputs (no topk_p/topk_index; has
+        # input_ids + last_hidden_states) and writes its outputs to a
+        # second set of static buffers.  Captured at the SAME batch
+        # sizes as the recurrent loop, so users get cuda graph coverage
+        # whenever the recurrent loop has it too.
+        #
+        # Set ``SGLANG_FROZEN_KV_MTP_DISABLE_SEED_CG=1`` to skip seed
+        # capture and fall back to the pre-PR eager seed path
+        # (for A/B benchmarking).
+        import logging as _logging
+        import os as _os
+
+        _seed_logger = _logging.getLogger(__name__)
+        self.seed_graphs: dict = {}
+        self.seed_output_buffers: dict = {}
+        if _os.environ.get("SGLANG_FROZEN_KV_MTP_DISABLE_SEED_CG", "0") == "1":
+            _seed_logger.warning(
+                "SGLANG_FROZEN_KV_MTP_DISABLE_SEED_CG=1: skipping seed "
+                "cuda graph capture (eager seed path)."
+            )
+            return
+        try:
+            _seed_logger.info("Capture Frozen-KV MTP seed cuda graph begin.")
+            self._init_seed_buffers()
+            with model_capture_mode():
+                self._capture_seed()
+            _seed_logger.info(
+                "Capture Frozen-KV MTP seed cuda graph end (captured %d batch sizes).",
+                len(self.seed_graphs),
+            )
+        except Exception as e:
+            # Seed capture failure is recoverable: fall back to eager
+            # seed (the pre-PR behavior).  Log loudly so users notice.
+            _seed_logger.warning(
+                "Capture Frozen-KV MTP seed cuda graph failed: %s\n"
+                "Falling back to eager seed step (the recurrent loop graphs are unaffected).",
+                e,
+            )
+            self.seed_graphs = {}
+            self.seed_output_buffers = {}
+
+    def _init_seed_buffers(self) -> None:
+        """Allocate static input/output buffers for the seed step.
+
+        Seed step is one decode-shape forward of the assistant: one input
+        token + last-hidden per request.  The captured graph writes
+        ``topk_p``, ``topk_index`` and ``hidden_states`` into the seed
+        output buffers; the worker's ``replay_seed`` copies them out
+        into a fresh ``FrozenKVMTPDraftInput`` for the next iter.
+        """
+        worker = self.frozen_kv_mtp_worker
+        hidden = worker._recurrent_hidden_size
+        # The seed step's expanded_bs is just bs (no topk fanout).
+        max_seed_bs = max(self.capture_bs)
+
+        with torch.device(self.model_runner.device):
+            req_pool_indices = torch.zeros((max_seed_bs,), dtype=torch.int64)
+            positions = torch.zeros((max_seed_bs,), dtype=torch.int64)
+            mrope_positions = torch.zeros((3, max_seed_bs), dtype=torch.int64)
+            seq_lens = torch.full(
+                (max_seed_bs,), self.seq_len_fill_value, dtype=torch.int32
+            )
+            input_ids = torch.zeros((max_seed_bs,), dtype=torch.int64)
+            hidden_states = torch.zeros(
+                (max_seed_bs, hidden), dtype=self.model_runner.dtype
+            )
+            out_topk_p = torch.zeros((max_seed_bs, self.topk), dtype=torch.float32)
+            out_topk_index = torch.zeros((max_seed_bs, self.topk), dtype=torch.int64)
+            out_hidden_states = torch.zeros(
+                (max_seed_bs, hidden), dtype=self.model_runner.dtype
+            )
+
+            if self.require_gathered_buffer:
+                if self.require_mlp_tp_gather:
+                    g_num_tokens = torch.zeros((self.dp_size,), dtype=torch.int32)
+                    g_num_tokens_logp = torch.zeros((self.dp_size,), dtype=torch.int32)
+                else:
+                    g_num_tokens = torch.zeros((1,), dtype=torch.int32)
+                    g_num_tokens_logp = torch.zeros((1,), dtype=torch.int32)
+            else:
+                g_num_tokens = None
+                g_num_tokens_logp = None
+
+        seq_lens_cpu = torch.full(
+            (max_seed_bs,), self.seq_len_fill_value, dtype=torch.int32
+        )
+
+        self.seed_buffers = FrozenKVMTPSeedInputBuffers(
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            input_ids=input_ids,
+            hidden_states=hidden_states,
+            out_topk_p=out_topk_p,
+            out_topk_index=out_topk_index,
+            out_hidden_states=out_hidden_states,
+            global_num_tokens_gpu=g_num_tokens,
+            global_num_tokens_for_logprob_gpu=g_num_tokens_logp,
+        )
+        self.seed_buffers.share_buffers()
+
+    def _capture_seed(self) -> None:
+        """Capture the seed-step graph for each batch size in ``capture_bs``."""
+        for bs in self.capture_bs:
+            graph, out = self._capture_one_seed_graph(bs)
+            self.seed_graphs[bs] = graph
+            self.seed_output_buffers[bs] = out
+
+    def _capture_one_seed_graph(self, bs: int):
+        """Build one captured seed-step graph for batch size ``bs``.
+
+        The captured graph:
+          1. Calls ``draft_model_runner.forward()`` on a decode-shape
+             ``ForwardBatch`` whose inputs come from
+             ``self.seed_buffers``.
+          2. Runs ``_capture_for_decode`` to extract topk_p / topk_index
+             / hidden_states into the seed output buffers.
+        """
+        worker = self.frozen_kv_mtp_worker
+        buffers = self.seed_buffers
+        graph = self._create_graph()
+        stream = self.stream
+
+        req_pool_indices = buffers.req_pool_indices[:bs]
+        positions = buffers.positions[:bs]
+        mrope_positions = buffers.mrope_positions[:, :bs]
+        seq_lens = buffers.seq_lens[:bs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+        input_ids = buffers.input_ids[:bs]
+        hidden_states = buffers.hidden_states[:bs]
+        out_topk_p = buffers.out_topk_p[:bs]
+        out_topk_index = buffers.out_topk_index[:bs]
+        out_hidden_states = buffers.out_hidden_states[:bs]
+
+        if self.require_mlp_tp_gather:
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor(
+                    [bs] * self.dp_size,
+                    dtype=torch.int32,
+                    device=buffers.positions.device,
+                )
+            )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor(
+                    [bs] * self.dp_size,
+                    dtype=torch.int32,
+                    device=buffers.positions.device,
+                )
+            )
+            global_num_tokens = buffers.global_num_tokens_gpu
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+            global_dp_buffer_len = bs * self.dp_size
+        elif self.require_attn_tp_gather:
+            buffers.global_num_tokens_gpu.copy_(
+                torch.tensor([bs], dtype=torch.int32, device=buffers.positions.device)
+            )
+            buffers.global_num_tokens_for_logprob_gpu.copy_(
+                torch.tensor([bs], dtype=torch.int32, device=buffers.positions.device)
+            )
+            global_num_tokens = buffers.global_num_tokens_gpu
+            global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
+            global_dp_buffer_len = bs
+        else:
+            global_num_tokens = None
+            global_num_tokens_for_logprob = None
+            global_dp_buffer_len = None
+
+        # Seed input on the FrozenKVMTPDraftInput is the recurrent
+        # ``hidden_states`` (= last target hidden); we install it now
+        # and the graph will read it from the static buffer on replay.
+        spec_info = FrozenKVMTPDraftInput()
+        spec_info.bonus_tokens = input_ids
+        spec_info.hidden_states = hidden_states
+        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.num_tokens_per_req = 1
+        spec_info.num_tokens_for_logprob_per_req = 1
+        spec_info.positions = positions
+
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=bs,
+            input_ids=input_ids,
+            req_pool_indices=req_pool_indices,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            out_cache_loc=None,
+            seq_lens_sum=seq_lens.sum().item(),
+            return_logprob=False,
+            positions=positions,
+            mrope_positions=mrope_positions,
+            global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_for_logprob_gpu=global_num_tokens_for_logprob,
+            dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
+            global_dp_buffer_len=global_dp_buffer_len,
+            spec_algorithm=self.model_runner.spec_algorithm,
+            spec_info=spec_info,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+
+        def run_once_seed():
+            if self.model_runner.is_hybrid_swa:
+                self.model_runner.token_to_kv_pool.invalidate_loc_cache()
+            forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
+            set_dp_buffer_len(
+                global_dp_buffer_len,
+                bs,
+                forward_batch.dp_padding_mode.is_max_len(),
+            )
+            set_is_extend_in_batch(False)
+            # Run the draft model forward (one decode step).
+            logits_output = self.model_runner.forward(
+                forward_batch, skip_attn_backend_init=True
+            ).logits_output
+            # Compute seed topk_p / topk_index / hidden_states and
+            # write into our static output buffers (in-place copy).
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            from sglang.srt.speculative.frozen_kv_mtp_utils import fast_topk
+
+            seed_topk_p, seed_topk_index = fast_topk(probs, self.topk, dim=-1)
+            out_topk_p.copy_(seed_topk_p)
+            out_topk_index.copy_(seed_topk_index)
+            out_hidden_states.copy_(logits_output.hidden_states)
+            return out_topk_p, out_topk_index, out_hidden_states
+
+        # Same target-KV-pool swap protocol as the recurrent capture.
+        from sglang.srt.speculative.frozen_kv_mtp_utils import (
+            _maybe_swap_swa_state,
+            _restore_swa_state,
+        )
+
+        target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
+        saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
+        self.draft_attn_backend.token_to_kv_pool = target_pool
+        saved_swa_state = _maybe_swap_swa_state(self.draft_attn_backend, target_pool)
+        try:
+            with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
+                self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(
+                    forward_batch
+                )
+                self.deepep_adapter.capture(is_extend_in_batch=False)
+                self._capture_init(run_once_seed)
+                out = self._capture_graph(
+                    graph, get_global_graph_memory_pool(), stream, run_once_seed
+                )
+        finally:
+            self.draft_attn_backend.token_to_kv_pool = saved_backend_pool
+            _restore_swa_state(self.draft_attn_backend, saved_swa_state)
+        set_global_graph_memory_pool(graph.pool())
+        return graph, out
+
+    def can_run_seed(self, bs: int) -> bool:
+        """True iff a captured seed-step graph exists for ``bs``."""
+        if not self.seed_graphs:
+            return False
+        if self.disable_padding:
+            return bs in self.seed_graphs
+        return bs <= self.max_bs
+
+    def replay_seed(
+        self,
+        bs: int,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_sum: int,
+    ):
+        """Replay the captured seed-step graph and return the populated
+        ``(topk_p, topk_index, hidden_states)`` tensors sized ``[bs, ...]``.
+
+        Caller must ensure ``bs`` is in ``self.capture_bs`` (or padded to
+        the nearest captured size up to ``max_bs``) and that the input
+        tensors match the shape contract of the captured graph.
+        """
+        buffers = self.seed_buffers
+        # Pick the smallest captured bs >= raw_bs (mirrors recurrent replay).
+        index = bisect.bisect_left(self.capture_bs, bs)
+        graph_bs = self.capture_bs[index]
+        if graph_bs != bs:
+            buffers.seq_lens.fill_(self.seq_len_fill_value)
+            buffers.positions.zero_()
+            buffers.input_ids.zero_()
+
+        buffers.req_pool_indices[:bs].copy_(req_pool_indices)
+        buffers.positions[:bs].copy_(positions)
+        buffers.seq_lens[:bs].copy_(seq_lens)
+        buffers.input_ids[:bs].copy_(input_ids)
+        buffers.hidden_states[:bs].copy_(hidden_states)
+        if seq_lens_cpu is not None:
+            if graph_bs != bs:
+                buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
+            buffers.seq_lens_cpu[:bs].copy_(seq_lens_cpu)
+
+        if self.require_gathered_buffer:
+            buffers.global_num_tokens_gpu.fill_(graph_bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(graph_bs)
+
+        # Build a transient ForwardBatch ONLY for the metadata replay
+        # call (the graph itself uses the static buffers).
+        from sglang.srt.model_executor.forward_batch_info import (
+            ForwardBatch as _FB,
+            ForwardMode as _FM,
+        )
+
+        meta_fb = _FB(
+            forward_mode=_FM.DECODE,
+            batch_size=graph_bs,
+            input_ids=buffers.input_ids[:graph_bs],
+            req_pool_indices=buffers.req_pool_indices[:graph_bs],
+            seq_lens=buffers.seq_lens[:graph_bs],
+            seq_lens_cpu=buffers.seq_lens_cpu[:graph_bs],
+            out_cache_loc=None,
+            seq_lens_sum=seq_lens_sum + (graph_bs - bs) * self.seq_len_fill_value,
+            return_logprob=False,
+            positions=buffers.positions[:graph_bs],
+            spec_algorithm=self.model_runner.spec_algorithm,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        self.frozen_kv_mtp_worker._init_frozen_kv_metadata_replay_cuda_graph(
+            meta_fb, graph_bs, meta_fb.seq_lens_sum
+        )
+
+        self.seed_graphs[graph_bs].replay()
+        out_topk_p, out_topk_index, out_hidden_states = self.seed_output_buffers[
+            graph_bs
+        ]
+        # Slice back to raw bs for the caller.
+        return (
+            out_topk_p[:bs].clone(),
+            out_topk_index[:bs].clone(),
+            out_hidden_states[:bs].clone(),
+        )
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
@@ -315,9 +699,7 @@ class FrozenKVMTPCudaGraphRunner:
         target_pool = self.frozen_kv_mtp_worker.kv_context.target_token_to_kv_pool
         saved_backend_pool = self.draft_attn_backend.token_to_kv_pool
         self.draft_attn_backend.token_to_kv_pool = target_pool
-        saved_swa_state = _maybe_swap_swa_state(
-            self.draft_attn_backend, target_pool
-        )
+        saved_swa_state = _maybe_swap_swa_state(self.draft_attn_backend, target_pool)
         try:
             with forward_context(ForwardContext(attn_backend=self.draft_attn_backend)):
                 self.frozen_kv_mtp_worker._init_frozen_kv_metadata_capture_cuda_graph(

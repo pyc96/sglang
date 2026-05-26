@@ -136,8 +136,10 @@ class FrozenKVMTPWorker(TpModelWorker):
         self.hot_token_id = None
 
         with (
-            empty_context()
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            empty_context(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -397,15 +399,55 @@ class FrozenKVMTPWorker(TpModelWorker):
             if mm_input_embeds is not None:
                 forward_batch.mm_input_embeds = mm_input_embeds
             self._set_positions(forward_batch)
-            self._init_frozen_kv_metadata(forward_batch)
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
-            ):
-                logits_output = self.draft_model_runner.forward(
-                    forward_batch, skip_attn_backend_init=True
-                ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
-            self._capture_for_decode(logits_output, draft_input)
+
+            # Seed-step CUDA graph fast path.  When the recurrent-loop
+            # runner has captured a seed-step graph for this batch size
+            # AND nothing about the request requires the eager path
+            # (no multimodal embeds, no mrope position trickery), reuse
+            # the captured graph instead of paying for an eager forward.
+            # This closes the ~20-25 % decode-wall-time gap caused by
+            # the seed step running eager (see PR body for full
+            # measurement of the contribution).
+            use_seed_graph = (
+                self.cuda_graph_runner is not None
+                and mm_input_embeds is None
+                and forward_batch.mrope_positions is None
+                and self.cuda_graph_runner.can_run_seed(forward_batch.batch_size)
+            )
+
+            if use_seed_graph:
+                with self._target_kv_pool_view(forward_batch):
+                    seed_topk_p, seed_topk_index, seed_hidden = (
+                        self.cuda_graph_runner.replay_seed(
+                            bs=forward_batch.batch_size,
+                            input_ids=forward_batch.input_ids,
+                            hidden_states=draft_input.hidden_states,
+                            positions=forward_batch.positions,
+                            seq_lens=forward_batch.seq_lens,
+                            seq_lens_cpu=forward_batch.seq_lens_cpu,
+                            req_pool_indices=forward_batch.req_pool_indices,
+                            seq_lens_sum=int(forward_batch.seq_lens_sum or 0),
+                        )
+                    )
+                # Stitch the seed graph's outputs onto draft_input so
+                # the next iter's recurrent loop reads them via
+                # ``spec_info.topk_p / topk_index / hidden_states``.
+                draft_input.topk_p = seed_topk_p
+                draft_input.topk_index = seed_topk_index
+                draft_input.hidden_states = seed_hidden
+            else:
+                self._init_frozen_kv_metadata(forward_batch)
+                with (
+                    self._target_kv_pool_view(forward_batch),
+                    forward_context(
+                        ForwardContext(attn_backend=self.draft_attn_backend)
+                    ),
+                ):
+                    logits_output = self.draft_model_runner.forward(
+                        forward_batch, skip_attn_backend_init=True
+                    ).logits_output
+                maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
+                self._capture_for_decode(logits_output, draft_input)
         finally:
             batch.forward_mode = forward_mode_backup
             batch.input_ids = input_ids_backup
@@ -682,8 +724,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
 
-            with self._target_kv_pool_view(forward_batch), forward_context(
-                ForwardContext(attn_backend=self.draft_attn_backend)
+            with (
+                self._target_kv_pool_view(forward_batch),
+                forward_context(ForwardContext(attn_backend=self.draft_attn_backend)),
             ):
                 logits_output = self.draft_model_runner.forward(
                     forward_batch, skip_attn_backend_init=True
